@@ -1,0 +1,43 @@
+# Node / Frontend
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+media/
+staticfiles/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local test database
+test_db.sqlite3
+
+# Local archive copies
+examcraft-ai-backend*.zip

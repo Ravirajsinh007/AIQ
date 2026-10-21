@@ -1,0 +1,6 @@
+{
+  "name": "ExamCraft AI Backend",
+  "description": "Enterprise multi-tenant Django REST Framework backend for AI-powered question paper generation, academic structure, and assessment management with Supabase PostgreSQL and Gemini integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

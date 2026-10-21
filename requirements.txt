@@ -1,0 +1,17 @@
+Django>=5.1,<5.3
+djangorestframework>=3.15.2
+djangorestframework-simplejwt>=5.3.1
+django-cors-headers>=4.4.0
+django-filter>=24.3
+drf-spectacular>=0.27.2
+dj-database-url>=2.2.0
+psycopg[binary]>=3.2.0
+python-dotenv>=1.0.1
+pydantic>=2.8.0
+pypdf>=4.3.0
+python-docx>=1.1.2
+google-genai>=1.0.0
+pytest>=8.3.0
+pytest-django>=4.9.0
+gunicorn>=22.0.0
+openpyxl>=3.1.5
