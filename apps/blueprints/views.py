@@ -50,11 +50,18 @@ from .serializers import (
 class BlueprintChildAuditMixin:
     @transaction.atomic
     def perform_create(self, serializer):
+        blueprint = self._blueprint_for(serializer.validated_data)
+        self.check_object_permissions(self.request, blueprint)
         instance = serializer.save()
         self._record_child_audit(instance, 'created')
 
     @transaction.atomic
     def perform_update(self, serializer):
+        blueprint = self._blueprint_for(
+            serializer.validated_data,
+            instance=serializer.instance,
+        )
+        self.check_object_permissions(self.request, blueprint)
         instance = serializer.save()
         self._record_child_audit(instance, 'updated')
 
@@ -74,6 +81,18 @@ class BlueprintChildAuditMixin:
             actor=self.request.user,
             institute=blueprint.institute,
         )
+
+    @staticmethod
+    def _blueprint_for(validated_data, instance=None):
+        section = validated_data.get(
+            'section',
+            getattr(instance, 'section', None),
+        )
+        blueprint = validated_data.get(
+            'blueprint',
+            getattr(instance, 'blueprint', None),
+        )
+        return blueprint or section.blueprint
 
 
 class PaperBlueprintViewSet(viewsets.ModelViewSet):
@@ -104,20 +123,19 @@ class PaperBlueprintViewSet(viewsets.ModelViewSet):
 
         memberships = user.memberships.filter(
             status=MembershipStatus.ACTIVE,
-            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF, RoleChoices.TEACHER],
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
         )
         manager_institutes = memberships.filter(
             role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF]
         ).values_list('institute_id', flat=True)
+        teacher_subjects = user.memberships.filter(
+            status=MembershipStatus.ACTIVE,
+            role=RoleChoices.TEACHER,
+            teaching_assignments__status='active',
+        ).values_list('teaching_assignments__subject_id', flat=True)
         return PaperBlueprint.objects.filter(
             Q(institute_id__in=manager_institutes)
-            | Q(
-                subject__teacher_assignments__teacher__user=user,
-                subject__teacher_assignments__teacher__role=RoleChoices.TEACHER,
-                subject__teacher_assignments__teacher__status=MembershipStatus.ACTIVE,
-                subject__teacher_assignments__status='active',
-            )
-            | Q(created_by=user, institute__memberships__in=memberships)
+            | Q(subject_id__in=teacher_subjects)
         ).select_related(
             'institute', 'subject', 'academic_year', 'semester', 'program', 'department', 'created_by'
         ).prefetch_related('sections__rules').distinct()
@@ -127,20 +145,23 @@ class PaperBlueprintViewSet(viewsets.ModelViewSet):
         user = self.request.user
         membership = user.memberships.filter(
             institute=serializer.validated_data['institute'],
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
             status=MembershipStatus.ACTIVE
         ).first()
-        if not user.is_platform_admin and (
-            membership is None
-            or membership.role not in [RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF, RoleChoices.TEACHER]
-        ):
+        teacher_membership = user.memberships.filter(
+            institute=serializer.validated_data['institute'],
+            role=RoleChoices.TEACHER,
+            status=MembershipStatus.ACTIVE,
+        ).first()
+        if not user.is_platform_admin and membership is None and teacher_membership is None:
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied('You are not authorized to manage blueprints for this institute.')
 
         # If user is a teacher, verify teaching assignment for this subject
-        if membership and membership.role == RoleChoices.TEACHER:
+        if teacher_membership and membership is None:
             subj = serializer.validated_data['subject']
-            is_assigned = membership.teaching_assignments.filter(
+            is_assigned = teacher_membership.teaching_assignments.filter(
                 subject=subj,
                 status='active'
             ).exists()
@@ -291,7 +312,7 @@ class BlueprintSectionViewSet(BlueprintChildAuditMixin, viewsets.ModelViewSet):
 
         memberships = user.memberships.filter(
             status=MembershipStatus.ACTIVE,
-            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF, RoleChoices.TEACHER],
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
         )
         manager_institutes = memberships.filter(
             role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF]
@@ -378,15 +399,14 @@ class GeneratedPaperViewSet(viewsets.ReadOnlyModelViewSet):
         manager_institutes = memberships.filter(
             role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF]
         ).values_list('institute_id', flat=True)
+        teacher_subjects = user.memberships.filter(
+            status=MembershipStatus.ACTIVE,
+            role=RoleChoices.TEACHER,
+            teaching_assignments__status='active',
+        ).values_list('teaching_assignments__subject_id', flat=True)
         return GeneratedPaper.objects.filter(
             Q(institute_id__in=manager_institutes)
-            | Q(
-                subject__teacher_assignments__teacher__user=user,
-                subject__teacher_assignments__teacher__role=RoleChoices.TEACHER,
-                subject__teacher_assignments__teacher__status=MembershipStatus.ACTIVE,
-                subject__teacher_assignments__status='active',
-            )
-            | Q(created_by=user, institute__memberships__in=memberships)
+            | Q(subject_id__in=teacher_subjects)
         ).select_related(
             'institute', 'blueprint', 'subject', 'created_by'
         ).prefetch_related('paper_questions').distinct()

@@ -1,7 +1,9 @@
 from rest_framework import serializers
 from django.utils import timezone
-from apps.accounts.models import RoleChoices, MembershipStatus
+from apps.accounts.models import RoleChoices, MembershipStatus, UserInstituteMembership
+from .services import sync_subject_teachers, system_program_for_department
 from .models import (
+    AcademicStatus,
     Department,
     Program,
     AcademicYear,
@@ -34,6 +36,11 @@ def validate_mapping_write_institute(serializer, institute_id):
         raise serializers.ValidationError('Institute administrator permission is required.')
 
 
+class BatchDepartmentField(serializers.PrimaryKeyRelatedField):
+    def get_attribute(self, instance):
+        return instance.program.department
+
+
 class DepartmentSerializer(serializers.ModelSerializer):
     institute_code = serializers.CharField(source='institute.code', read_only=True)
 
@@ -44,6 +51,12 @@ class DepartmentSerializer(serializers.ModelSerializer):
 
     def validate_code(self, value):
         return value.strip().upper()
+
+    def validate(self, attrs):
+        institute = attrs.get('institute', getattr(self.instance, 'institute', None))
+        if institute:
+            validate_mapping_write_institute(self, institute.id)
+        return attrs
 
 
 class ProgramSerializer(serializers.ModelSerializer):
@@ -60,8 +73,10 @@ class ProgramSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def validate(self, attrs):
-        dept = attrs.get('department')
-        inst = attrs.get('institute')
+        dept = attrs.get('department', getattr(self.instance, 'department', None))
+        inst = attrs.get('institute', getattr(self.instance, 'institute', None))
+        if inst:
+            validate_mapping_write_institute(self, inst.id)
         if dept and inst and dept.institute_id != inst.id:
             raise serializers.ValidationError({'department': 'Department must belong to the selected institute.'})
         return attrs
@@ -76,8 +91,11 @@ class AcademicYearSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def validate(self, attrs):
-        start = attrs.get('start_date')
-        end = attrs.get('end_date')
+        institute = attrs.get('institute', getattr(self.instance, 'institute', None))
+        start = attrs.get('start_date', getattr(self.instance, 'start_date', None))
+        end = attrs.get('end_date', getattr(self.instance, 'end_date', None))
+        if institute:
+            validate_mapping_write_institute(self, institute.id)
         if start and end and start >= end:
             raise serializers.ValidationError({'end_date': 'End date must be after start date.'})
         return attrs
@@ -92,9 +110,16 @@ class SemesterSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def validate(self, attrs):
-        prog = attrs.get('program')
-        sem_num = attrs.get('semester_number')
-        if prog and sem_num and sem_num > prog.total_semesters:
+        prog = attrs.get('program', getattr(self.instance, 'program', None))
+        sem_num = attrs.get('semester_number', getattr(self.instance, 'semester_number', None))
+        if prog:
+            validate_mapping_write_institute(self, prog.institute_id)
+        if (
+            prog
+            and sem_num
+            and prog.total_semesters is not None
+            and sem_num > prog.total_semesters
+        ):
             raise serializers.ValidationError({
                 'semester_number': f"Semester number cannot exceed program's total semesters ({prog.total_semesters})."
             })
@@ -104,18 +129,84 @@ class SemesterSerializer(serializers.ModelSerializer):
 class BatchSerializer(serializers.ModelSerializer):
     program_code = serializers.CharField(source='program.code', read_only=True)
     institute_code = serializers.CharField(source='institute.code', read_only=True)
+    department = BatchDepartmentField(
+        queryset=Department.objects.all(),
+        required=False,
+    )
+    department_name = serializers.CharField(source='program.department.name', read_only=True)
+    program = serializers.PrimaryKeyRelatedField(
+        queryset=Program.objects.all(),
+        required=False,
+    )
 
     class Meta:
         model = Batch
-        fields = ['id', 'institute', 'institute_code', 'program', 'program_code', 'name', 'admission_year', 'status', 'created_at', 'updated_at']
+        fields = [
+            'id', 'institute', 'institute_code', 'program', 'program_code',
+            'department', 'department_name', 'name', 'admission_year', 'status',
+            'created_at', 'updated_at'
+        ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+        validators = []
 
     def validate(self, attrs):
-        prog = attrs.get('program')
-        inst = attrs.get('institute')
+        department = attrs.get('department')
+        prog = attrs.get('program', getattr(self.instance, 'program', None))
+        inst = attrs.get('institute', getattr(self.instance, 'institute', None))
+        if department:
+            validate_mapping_write_institute(self, department.institute_id)
+            if inst and department.institute_id != inst.id:
+                raise serializers.ValidationError({
+                    'department': 'Department must belong to the selected institute.'
+                })
+            if prog and prog.department_id != department.id:
+                raise serializers.ValidationError({
+                    'program': 'Program must belong to the selected department.'
+                })
+            attrs['_department'] = department
+        elif prog:
+            attrs['_department'] = prog.department
+        elif self.instance:
+            attrs['_department'] = self.instance.program.department
+        else:
+            raise serializers.ValidationError({
+                'department': 'Select the department for this batch.'
+            })
+        if inst:
+            validate_mapping_write_institute(self, inst.id)
         if prog and inst and prog.institute_id != inst.id:
             raise serializers.ValidationError({'program': 'Program must belong to the selected institute.'})
+        name = attrs.get('name', getattr(self.instance, 'name', ''))
+        uniqueness_program = prog
+        if uniqueness_program is None and department:
+            uniqueness_program = Program.objects.filter(
+                institute=department.institute,
+                code=f"SYS-{department.code}"[:50],
+            ).first()
+        if name and uniqueness_program:
+            existing = Batch.objects.filter(program=uniqueness_program, name=name)
+            if self.instance:
+                existing = existing.exclude(pk=self.instance.pk)
+            if existing.exists():
+                raise serializers.ValidationError({
+                    'name': 'A batch with this name already exists in the selected department.'
+                })
         return attrs
+
+    def create(self, validated_data):
+        department = validated_data.pop('_department')
+        validated_data.pop('department', None)
+        program = validated_data.get('program')
+        if program is None:
+            validated_data['program'] = system_program_for_department(department)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        department = validated_data.pop('_department', None)
+        validated_data.pop('department', None)
+        if department is not None and 'program' not in validated_data:
+            validated_data['program'] = system_program_for_department(department)
+        return super().update(instance, validated_data)
 
 
 class SectionSerializer(serializers.ModelSerializer):
@@ -126,30 +217,85 @@ class SectionSerializer(serializers.ModelSerializer):
         fields = ['id', 'batch', 'batch_name', 'name', 'status', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        batch = attrs.get('batch', getattr(self.instance, 'batch', None))
+        if batch:
+            validate_mapping_write_institute(self, batch.institute_id)
+        return attrs
+
 
 class SubjectSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source='department.name', read_only=True)
     institute_code = serializers.CharField(source='institute.code', read_only=True)
+    teacher_ids = serializers.PrimaryKeyRelatedField(
+        queryset=UserInstituteMembership.objects.filter(
+            role=RoleChoices.TEACHER,
+            status=MembershipStatus.ACTIVE,
+        ),
+        many=True,
+        required=False,
+        write_only=True,
+    )
+    assigned_teacher_ids = serializers.SerializerMethodField()
+    assigned_teacher_names = serializers.SerializerMethodField()
 
     class Meta:
         model = Subject
         fields = [
             'id', 'institute', 'institute_code', 'department', 'department_name',
-            'code', 'name', 'description', 'credit_hours', 'status', 'created_at', 'updated_at'
+            'code', 'name', 'description', 'credit_hours', 'status', 'created_at', 'updated_at',
+            'teacher_ids', 'assigned_teacher_ids', 'assigned_teacher_names',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def get_assigned_teacher_ids(self, subject):
+        return list(
+            subject.teacher_assignments.filter(status='active')
+            .values_list('teacher_id', flat=True)
+            .distinct()
+        )
+
+    def get_assigned_teacher_names(self, subject):
+        memberships = subject.teacher_assignments.filter(
+            status='active'
+        ).select_related('teacher__user')
+        return list(dict.fromkeys(assignment.teacher.user.full_name for assignment in memberships))
+
     def validate(self, attrs):
-        dept = attrs.get('department')
-        inst = attrs.get('institute')
+        dept = attrs.get('department', getattr(self.instance, 'department', None))
+        inst = attrs.get('institute', getattr(self.instance, 'institute', None))
+        if inst:
+            validate_mapping_write_institute(self, inst.id)
         if dept and inst and dept.institute_id != inst.id:
             raise serializers.ValidationError({'department': 'Department must belong to the selected institute.'})
+        teachers = attrs.get('teacher_ids', [])
+        target_institute = inst or (dept.institute if dept else getattr(self.instance, 'institute', None))
+        if target_institute and any(
+            teacher.institute_id != target_institute.id for teacher in teachers
+        ):
+            raise serializers.ValidationError({
+                'teacher_ids': 'Every assigned teacher must have an active Teacher membership in this institute.'
+            })
         return attrs
+
+    def create(self, validated_data):
+        teachers = validated_data.pop('teacher_ids', None)
+        subject = super().create(validated_data)
+        if teachers is not None:
+            sync_subject_teachers(subject=subject, teachers=teachers)
+        return subject
+
+    def update(self, instance, validated_data):
+        teachers = validated_data.pop('teacher_ids', None)
+        subject = super().update(instance, validated_data)
+        if teachers is not None:
+            sync_subject_teachers(subject=subject, teachers=teachers)
+        return subject
 
 
 class ProgramSemesterSubjectSerializer(serializers.ModelSerializer):
     program_code = serializers.CharField(source='program.code', read_only=True)
-    semester_label = serializers.CharField(source='semester.label', read_only=True)
+    semester_label = serializers.CharField(source='semester.label', read_only=True, allow_null=True)
     subject_code = serializers.CharField(source='subject.code', read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
 
@@ -163,10 +309,12 @@ class ProgramSemesterSubjectSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def validate(self, attrs):
-        prog = attrs.get('program')
-        sem = attrs.get('semester')
-        subj = attrs.get('subject')
+        prog = attrs.get('program', getattr(self.instance, 'program', None))
+        sem = attrs.get('semester', getattr(self.instance, 'semester', None))
+        subj = attrs.get('subject', getattr(self.instance, 'subject', None))
 
+        if prog:
+            validate_mapping_write_institute(self, prog.institute_id)
         if prog and sem and sem.program_id != prog.id:
             raise serializers.ValidationError({'semester': 'Semester must belong to the selected program.'})
         if prog and subj and subj.institute_id != prog.institute_id:
@@ -182,6 +330,12 @@ class UnitSerializer(serializers.ModelSerializer):
         fields = ['id', 'subject', 'subject_code', 'unit_number', 'title', 'description', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        subject = attrs.get('subject', getattr(self.instance, 'subject', None))
+        if subject:
+            validate_mapping_write_institute(self, subject.institute_id)
+        return attrs
+
 
 class TopicSerializer(serializers.ModelSerializer):
     unit_title = serializers.CharField(source='unit.title', read_only=True)
@@ -192,6 +346,12 @@ class TopicSerializer(serializers.ModelSerializer):
         fields = ['id', 'unit', 'unit_title', 'subject_code', 'title', 'description', 'order', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def validate(self, attrs):
+        unit = attrs.get('unit', getattr(self.instance, 'unit', None))
+        if unit:
+            validate_mapping_write_institute(self, unit.subject.institute_id)
+        return attrs
+
 
 class LearningOutcomeSerializer(serializers.ModelSerializer):
     subject_code = serializers.CharField(source='subject.code', read_only=True)
@@ -200,6 +360,12 @@ class LearningOutcomeSerializer(serializers.ModelSerializer):
         model = LearningOutcome
         fields = ['id', 'subject', 'subject_code', 'code', 'description', 'category', 'created_at', 'updated_at']
         read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate(self, attrs):
+        subject = attrs.get('subject', getattr(self.instance, 'subject', None))
+        if subject:
+            validate_mapping_write_institute(self, subject.institute_id)
+        return attrs
 
 
 class ProgramOutcomeSerializer(serializers.ModelSerializer):
@@ -285,10 +451,12 @@ class SyllabusMappingSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def validate(self, attrs):
-        subj = attrs.get('subject')
-        ay = attrs.get('academic_year')
-        topic = attrs.get('topic')
+        subj = attrs.get('subject', getattr(self.instance, 'subject', None))
+        ay = attrs.get('academic_year', getattr(self.instance, 'academic_year', None))
+        topic = attrs.get('topic', getattr(self.instance, 'topic', None))
 
+        if subj:
+            validate_mapping_write_institute(self, subj.institute_id)
         if subj and ay and subj.institute_id != ay.institute_id:
             raise serializers.ValidationError({'academic_year': 'Academic year must belong to the same institute as the subject.'})
         if subj and topic and topic.unit.subject_id != subj.id:
@@ -301,27 +469,36 @@ class TeacherAssignmentSerializer(serializers.ModelSerializer):
     teacher_email = serializers.CharField(source='teacher.user.email', read_only=True)
     subject_code = serializers.CharField(source='subject.code', read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
-    academic_year_label = serializers.CharField(source='academic_year.label', read_only=True)
+    academic_year_label = serializers.CharField(
+        source='academic_year.label',
+        read_only=True,
+        allow_null=True,
+    )
+    batch_name = serializers.CharField(source='batch.name', read_only=True, allow_null=True)
+    section_name = serializers.CharField(source='section.name', read_only=True, allow_null=True)
 
     class Meta:
         model = TeacherAssignment
         fields = [
             'id', 'teacher', 'teacher_name', 'teacher_email', 'subject',
             'subject_code', 'subject_name', 'academic_year', 'academic_year_label',
-            'batch', 'section', 'status', 'created_at', 'updated_at'
+            'batch', 'batch_name', 'section', 'section_name', 'status', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def validate(self, attrs):
-        teacher = attrs.get('teacher')
-        subj = attrs.get('subject')
-        ay = attrs.get('academic_year')
-        batch = attrs.get('batch')
-        section = attrs.get('section')
+        teacher = attrs.get('teacher', getattr(self.instance, 'teacher', None))
+        subj = attrs.get('subject', getattr(self.instance, 'subject', None))
+        ay = attrs.get('academic_year', getattr(self.instance, 'academic_year', None))
+        batch = attrs.get('batch', getattr(self.instance, 'batch', None))
+        section = attrs.get('section', getattr(self.instance, 'section', None))
 
         if teacher:
+            validate_mapping_write_institute(self, teacher.institute_id)
             if teacher.role not in [RoleChoices.TEACHER, RoleChoices.EXAM_STAFF]:
                 raise serializers.ValidationError({'teacher': 'Assigned member must have Teacher or Exam Staff role.'})
+            if teacher.status != MembershipStatus.ACTIVE:
+                raise serializers.ValidationError({'teacher': 'Assigned member must have an active institute membership.'})
             if subj and teacher.institute_id != subj.institute_id:
                 raise serializers.ValidationError({'subject': 'Teacher and Subject must belong to the same institute.'})
             if ay and teacher.institute_id != ay.institute_id:
@@ -338,30 +515,44 @@ class StudentAcademicPlacementSerializer(serializers.ModelSerializer):
     student_email = serializers.CharField(source='student.user.email', read_only=True)
     student_identifier = serializers.CharField(source='student.identifier', read_only=True)
     program_code = serializers.CharField(source='program.code', read_only=True)
+    department_name = serializers.CharField(source='program.department.name', read_only=True)
     batch_name = serializers.CharField(source='batch.name', read_only=True)
-    semester_label = serializers.CharField(source='semester.label', read_only=True)
+    semester_label = serializers.CharField(source='semester.label', read_only=True, allow_null=True)
     section_name = serializers.CharField(source='section.name', read_only=True)
+    enrolled_subject_codes = serializers.SerializerMethodField()
 
     class Meta:
         model = StudentAcademicPlacement
         fields = [
             'id', 'student', 'student_name', 'student_email', 'student_identifier',
-            'program', 'program_code', 'batch', 'batch_name', 'semester',
-            'semester_label', 'section', 'section_name', 'effective_start_date',
+            'program', 'program_code', 'department_name', 'batch', 'batch_name',
+            'enrolled_subject_codes', 'semester', 'semester_label', 'section',
+            'section_name', 'effective_start_date',
             'effective_end_date', 'status', 'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
+    def get_enrolled_subject_codes(self, obj):
+        return list(
+            obj.student.subject_enrollments.filter(
+                batch=obj.batch,
+                status=AcademicStatus.ACTIVE,
+            ).values_list('subject__code', flat=True)
+        )
+
     def validate(self, attrs):
-        student = attrs.get('student')
-        prog = attrs.get('program')
-        batch = attrs.get('batch')
-        sem = attrs.get('semester')
-        section = attrs.get('section')
+        student = attrs.get('student', getattr(self.instance, 'student', None))
+        prog = attrs.get('program', getattr(self.instance, 'program', None))
+        batch = attrs.get('batch', getattr(self.instance, 'batch', None))
+        sem = attrs.get('semester', getattr(self.instance, 'semester', None))
+        section = attrs.get('section', getattr(self.instance, 'section', None))
 
         if student:
+            validate_mapping_write_institute(self, student.institute_id)
             if student.role != RoleChoices.STUDENT:
                 raise serializers.ValidationError({'student': 'Only members with Student role can have placements.'})
+            if student.status != MembershipStatus.ACTIVE:
+                raise serializers.ValidationError({'student': 'Student must have an active institute membership.'})
             if prog and student.institute_id != prog.institute_id:
                 raise serializers.ValidationError({'program': 'Student and Program must belong to the same institute.'})
         if batch and prog and batch.program_id != prog.id:

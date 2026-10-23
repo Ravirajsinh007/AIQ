@@ -17,7 +17,7 @@ class CanManageSourceMaterials(permissions.BasePermission):
     Role-based and tenant-scoped permission for Source Material document management:
     - Platform Admin: Full access.
     - Institute Admin & Exam Staff: Full access within own institute.
-    - Teachers: Allowed within own institute.
+    - Teachers: Read assigned-subject materials and modify only materials they uploaded.
     - Students: Strictly forbidden.
     """
 
@@ -55,18 +55,41 @@ class CanManageSourceMaterials(permissions.BasePermission):
         if not institute_id and hasattr(obj, 'document'):
             institute_id = obj.document.institute_id
 
-        return request.user.memberships.filter(
+        manager_membership = request.user.memberships.filter(
             institute_id=institute_id,
-            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.TEACHER, RoleChoices.EXAM_STAFF],
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
             status=MembershipStatus.ACTIVE
+        ).first()
+        if manager_membership:
+            return True
+
+        teacher_membership = request.user.memberships.filter(
+            institute_id=institute_id,
+            role=RoleChoices.TEACHER,
+            status=MembershipStatus.ACTIVE,
+        ).first()
+        if teacher_membership is None:
+            return False
+        subject_id = getattr(obj, 'subject_id', None)
+        if subject_id is None and hasattr(obj, 'document'):
+            subject_id = obj.document.subject_id
+        is_assigned = teacher_membership.teaching_assignments.filter(
+            subject_id=subject_id,
+            status='active',
         ).exists()
+        if not is_assigned:
+            return False
+        return request.method in permissions.SAFE_METHODS or (
+            getattr(obj, 'uploaded_by_id', None) == request.user.id
+        )
 
 
 class CanGenerateQuestions(permissions.BasePermission):
     """
     Permission for triggering and reviewing AI question generation jobs:
     - Platform Admin: Full access.
-    - Institute Admin, Exam Staff, Teachers: Allowed within their institute.
+    - Institute Admin & Exam Staff: Allowed within their institute.
+    - Teachers: Allowed only for actively assigned subjects.
     - Students: Strictly forbidden.
     """
 

@@ -11,6 +11,7 @@ from .views import (
     AccountActivationCompleteView,
     InstituteListCreateView,
     InstituteDetailView,
+    PlatformDashboardOverviewView,
     ProvisionAdminView,
     InstituteMemberListCreateView,
     InstituteMemberDetailView,
@@ -37,6 +38,7 @@ urlpatterns = [
     path('institutes/', InstituteListCreateView.as_view(), name='institute-list-create'),
     path('institutes/<uuid:institute_id>/', InstituteDetailView.as_view(), name='institute-detail'),
     path('institutes/<uuid:institute_id>/provision-admin/', ProvisionAdminView.as_view(), name='institute-provision-admin'),
+    path('platform/dashboard/overview/', PlatformDashboardOverviewView.as_view(), name='platform-dashboard-overview'),
 
     # Institute members (/api/v1/institutes/{institute_id}/members/...)
     path('institutes/<uuid:institute_id>/members/', InstituteMemberListCreateView.as_view(), name='institute-members-list-create'),

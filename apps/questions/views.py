@@ -33,10 +33,22 @@ def _require_question_scope(user, institute_id, subject):
     membership = user.memberships.filter(
         institute_id=institute_id,
         status='active',
-        role__in=['institute_admin', 'teacher', 'exam_staff'],
+        role__in=['institute_admin', 'exam_staff'],
     ).first()
-    if membership is None:
+    if membership is not None:
+        return
+    teacher_membership = user.memberships.filter(
+        institute_id=institute_id,
+        status='active',
+        role='teacher',
+    ).first()
+    if teacher_membership is None:
         raise PermissionDenied('You are not authorized to manage questions for this institute.')
+    if not teacher_membership.teaching_assignments.filter(
+        subject=subject,
+        status='active',
+    ).exists():
+        raise PermissionDenied('Teachers can manage questions only for subjects they are actively assigned to teach.')
 
 
 class QuestionViewSet(viewsets.ModelViewSet):
@@ -66,12 +78,19 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 'institute', 'subject', 'unit', 'topic', 'learning_outcome', 'created_by'
             ).prefetch_related('options', 'rubrics', 'source_references', 'tags')
 
-        staff_memberships = user.memberships.filter(
+        manager_memberships = user.memberships.filter(
             status='active',
-            role__in=['institute_admin', 'teacher', 'exam_staff'],
+            role__in=['institute_admin', 'exam_staff'],
         )
-        institute_ids = staff_memberships.values_list('institute_id', flat=True)
-        return Question.objects.filter(institute_id__in=institute_ids).distinct().select_related(
+        institute_ids = manager_memberships.values_list('institute_id', flat=True)
+        teacher_subjects = user.memberships.filter(
+            status='active',
+            role='teacher',
+            teaching_assignments__status='active',
+        ).values_list('teaching_assignments__subject_id', flat=True)
+        return Question.objects.filter(
+            Q(institute_id__in=institute_ids) | Q(subject_id__in=teacher_subjects)
+        ).distinct().select_related(
             'institute', 'subject', 'unit', 'topic', 'learning_outcome', 'created_by'
         ).prefetch_related('options', 'rubrics', 'source_references', 'tags')
 

@@ -1,5 +1,8 @@
 from django.contrib.auth import authenticate
+from django.db import transaction
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.utils import timezone
+from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 from rest_framework_simplejwt.tokens import RefreshToken
 from .models import (
@@ -21,6 +24,75 @@ class UserInstituteMembershipSerializer(serializers.ModelSerializer):
     institute_name = serializers.CharField(source='institute.name', read_only=True)
     user_email = serializers.CharField(source='user.email', read_only=True)
     user_name = serializers.CharField(source='user.full_name', read_only=True)
+    department_name = serializers.SerializerMethodField()
+    batch_name = serializers.SerializerMethodField()
+    enrolled_subject_codes = serializers.SerializerMethodField()
+    department = serializers.SerializerMethodField()
+    batch = serializers.SerializerMethodField()
+    subject_ids = serializers.SerializerMethodField()
+
+    def _current_placement(self, membership):
+        placements = getattr(membership, '_current_academic_placements', None)
+        if placements is None:
+            from apps.academics.models import PlacementStatus
+
+            placements = membership.academic_placements.filter(
+                status=PlacementStatus.ACTIVE,
+                effective_end_date__isnull=True,
+            ).select_related('program__department', 'batch').order_by('-created_at')
+        return next(iter(placements), None)
+
+    def get_department_name(self, membership):
+        placement = self._current_placement(membership)
+        return placement.program.department.name if placement else None
+
+    def get_batch_name(self, membership):
+        placement = self._current_placement(membership)
+        return placement.batch.name if placement else None
+
+    def get_department(self, membership):
+        placement = self._current_placement(membership)
+        return str(placement.program.department_id) if placement else None
+
+    def get_batch(self, membership):
+        placement = self._current_placement(membership)
+        return str(placement.batch_id) if placement else None
+
+    def get_subject_ids(self, membership):
+        placement = self._current_placement(membership)
+        if placement is None:
+            return []
+        enrollments = getattr(membership, '_active_subject_enrollments', None)
+        if enrollments is None:
+            from apps.academics.models import AcademicStatus
+
+            enrollments = membership.subject_enrollments.filter(
+                batch_id=placement.batch_id,
+                status=AcademicStatus.ACTIVE,
+            )
+        return [
+            str(enrollment.subject_id)
+            for enrollment in enrollments
+            if enrollment.batch_id == placement.batch_id
+        ]
+
+    def get_enrolled_subject_codes(self, membership):
+        placement = self._current_placement(membership)
+        if placement is None:
+            return []
+        enrollments = getattr(membership, '_active_subject_enrollments', None)
+        if enrollments is None:
+            from apps.academics.models import AcademicStatus
+
+            enrollments = membership.subject_enrollments.filter(
+                batch_id=placement.batch_id,
+                status=AcademicStatus.ACTIVE,
+            ).select_related('subject').order_by('subject__code')
+        return [
+            enrollment.subject.code
+            for enrollment in enrollments
+            if enrollment.batch_id == placement.batch_id
+        ]
 
     class Meta:
         model = UserInstituteMembership
@@ -29,6 +101,12 @@ class UserInstituteMembershipSerializer(serializers.ModelSerializer):
             'user',
             'user_email',
             'user_name',
+            'department_name',
+            'batch_name',
+            'enrolled_subject_codes',
+            'department',
+            'batch',
+            'subject_ids',
             'institute',
             'institute_code',
             'institute_name',
@@ -43,18 +121,115 @@ class UserInstituteMembershipSerializer(serializers.ModelSerializer):
 
 
 class MembershipUpdateSerializer(serializers.ModelSerializer):
+    department = serializers.UUIDField(required=False, write_only=True)
+    batch = serializers.UUIDField(required=False, write_only=True)
+    subject_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+    )
+
     class Meta:
         model = UserInstituteMembership
-        fields = ['role', 'exam_permissions', 'identifier', 'status']
+        fields = [
+            'role',
+            'exam_permissions',
+            'identifier',
+            'status',
+            'department',
+            'batch',
+            'subject_ids',
+        ]
 
     def validate_role(self, value):
-        if value == RoleChoices.PLATFORM_ADMIN:
-            raise serializers.ValidationError('Platform administrator access cannot be assigned through institute membership updates.')
+        if value in (RoleChoices.PLATFORM_ADMIN, RoleChoices.INSTITUTE_ADMIN):
+            raise serializers.ValidationError('Administrative roles cannot be assigned through institute membership updates.')
+        if self.instance and value != self.instance.role:
+            raise serializers.ValidationError('Membership roles cannot be changed through this endpoint.')
         return value
+
+    def validate(self, attrs):
+        academic_fields = ('department', 'batch', 'subject_ids')
+        if not any(field in attrs for field in academic_fields):
+            return attrs
+        if (
+            attrs.get('department') is None
+            and attrs.get('batch') is None
+            and attrs.get('subject_ids') == []
+        ):
+            attrs.pop('subject_ids', None)
+            return attrs
+        if self.instance.role != RoleChoices.STUDENT:
+            raise serializers.ValidationError({
+                'department': 'Academic enrollment details can only be updated for students.'
+            })
+        if not all(field in attrs for field in academic_fields):
+            raise serializers.ValidationError({
+                'department': 'Department, batch, and subject IDs must be supplied together.'
+            })
+        if not attrs['subject_ids']:
+            raise serializers.ValidationError({
+                'subject_ids': 'Select at least one subject for the student.'
+            })
+        if len(attrs['subject_ids']) != len(set(attrs['subject_ids'])):
+            raise serializers.ValidationError({'subject_ids': 'A subject may only be selected once.'})
+
+        from apps.academics.models import AcademicStatus, Batch, Department, Subject
+
+        department = Department.objects.filter(
+            pk=attrs['department'],
+            institute=self.instance.institute,
+            status=AcademicStatus.ACTIVE,
+        ).first()
+        if department is None:
+            raise serializers.ValidationError({'department': 'Select an active department in this institute.'})
+        batch = Batch.objects.select_related('program').filter(
+            pk=attrs['batch'],
+            institute=self.instance.institute,
+            status=AcademicStatus.ACTIVE,
+            program__department=department,
+        ).first()
+        if batch is None:
+            raise serializers.ValidationError({'batch': 'Select an active batch in the selected department.'})
+        subjects = list(Subject.objects.filter(
+            pk__in=attrs['subject_ids'],
+            institute=self.instance.institute,
+            department=department,
+            status=AcademicStatus.ACTIVE,
+        ))
+        if len(subjects) != len(attrs['subject_ids']):
+            raise serializers.ValidationError({
+                'subject_ids': 'Every selected subject must be active in the selected department and institute.'
+            })
+        attrs['department_object'] = department
+        attrs['batch_object'] = batch
+        attrs['subject_objects'] = subjects
+        return attrs
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        department = validated_data.pop('department_object', None)
+        batch = validated_data.pop('batch_object', None)
+        subjects = validated_data.pop('subject_objects', None)
+        validated_data.pop('department', None)
+        validated_data.pop('batch', None)
+        validated_data.pop('subject_ids', None)
+        membership = super().update(instance, validated_data)
+        if department is not None:
+            from apps.academics.services import configure_student_courses
+
+            configure_student_courses(
+                membership=membership,
+                department=department,
+                batch=batch,
+                subjects=subjects,
+            )
+        return membership
 
 
 class UserSerializer(serializers.ModelSerializer):
     memberships = UserInstituteMembershipSerializer(many=True, read_only=True)
+    is_platform_admin = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = User
@@ -67,6 +242,7 @@ class UserSerializer(serializers.ModelSerializer):
             'phone_number',
             'is_active',
             'is_verified',
+            'is_platform_admin',
             'must_change_password',
             'is_staff',
             'memberships',
@@ -250,6 +426,10 @@ class AccountActivationCompleteSerializer(serializers.Serializer):
         user.is_active = True
         user.must_change_password = False
         user.save(update_fields=['password', 'is_verified', 'is_active', 'must_change_password'])
+        user.memberships.filter(status=MembershipStatus.INVITED).update(
+            status=MembershipStatus.ACTIVE,
+            is_verified=True,
+        )
 
         verification.used_at = timezone.now()
         verification.save(update_fields=['used_at'])
@@ -261,6 +441,15 @@ class AccountActivationCompleteSerializer(serializers.Serializer):
 
 class InstituteSerializer(serializers.ModelSerializer):
     members_count = serializers.IntegerField(source='memberships.count', read_only=True)
+
+    def get_fields(self):
+        fields = super().get_fields()
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if user and user.is_authenticated and not user.is_platform_admin:
+            for field_name in ('code', 'name', 'status'):
+                fields[field_name].read_only = True
+        return fields
 
     class Meta:
         model = Institute
@@ -282,6 +471,11 @@ class InstituteSerializer(serializers.ModelSerializer):
         normalized = value.strip().upper()
         if not normalized:
             raise serializers.ValidationError('Institute code cannot be empty.')
+        existing = Institute.objects.filter(code__iexact=normalized)
+        if self.instance:
+            existing = existing.exclude(pk=self.instance.pk)
+        if existing.exists():
+            raise serializers.ValidationError('An institute with this code already exists.')
         return normalized
 
 
@@ -346,12 +540,26 @@ class CreateMemberSerializer(serializers.Serializer):
         choices=[RoleChoices.TEACHER, RoleChoices.STUDENT, RoleChoices.EXAM_STAFF],
         default=RoleChoices.STUDENT
     )
+    initial_password = serializers.CharField(
+        required=True,
+        min_length=8,
+        write_only=True,
+        trim_whitespace=False,
+    )
     identifier = serializers.CharField(required=False, allow_blank=True, default='', max_length=100)
     phone_number = serializers.CharField(required=False, allow_blank=True, default='', max_length=32)
     exam_permissions = serializers.ListField(
         child=serializers.CharField(),
         required=False,
         default=list
+    )
+    department = serializers.UUIDField(required=False, write_only=True)
+    batch = serializers.UUIDField(required=False, write_only=True)
+    subject_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        write_only=True,
+        default=list,
     )
 
     def validate(self, attrs):
@@ -360,13 +568,87 @@ class CreateMemberSerializer(serializers.Serializer):
 
         if UserInstituteMembership.objects.filter(user__email=email, institute=institute).exists():
             raise serializers.ValidationError({'email': 'User is already a member of this institute.'})
+        existing_user = User.objects.filter(email=email).first()
+        if existing_user and not existing_user.is_active:
+            raise serializers.ValidationError({
+                'email': 'This account is inactive. Contact a platform administrator before adding it.'
+            })
 
+        candidate = User(
+            email=email,
+            first_name=attrs['first_name'],
+            last_name=attrs['last_name'],
+        )
+        try:
+            validate_password(attrs['initial_password'], user=candidate)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'initial_password': list(exc.messages)}) from exc
+
+        role = attrs['role']
         identifier = attrs.get('identifier', '').strip()
-        if identifier and UserInstituteMembership.objects.filter(institute=institute, identifier=identifier).exists():
+        if role == RoleChoices.STUDENT:
+            identifier = identifier.upper()
+            if not identifier:
+                raise serializers.ValidationError({'identifier': 'A student roll number is required.'})
+            department_id = attrs.get('department')
+            batch_id = attrs.get('batch')
+            subject_ids = attrs.get('subject_ids', [])
+            if not department_id or not batch_id:
+                raise serializers.ValidationError({
+                    'department': 'Select a department and batch for the student.'
+                })
+            if not subject_ids:
+                raise serializers.ValidationError({
+                    'subject_ids': 'Select at least one subject for the student.'
+                })
+            if len(subject_ids) != len(set(subject_ids)):
+                raise serializers.ValidationError({'subject_ids': 'A subject may only be selected once.'})
+
+            from apps.academics.models import AcademicStatus, Batch, Department, Subject
+
+            department = Department.objects.filter(
+                pk=department_id,
+                institute=institute,
+                status=AcademicStatus.ACTIVE,
+            ).first()
+            if department is None:
+                raise serializers.ValidationError({'department': 'Select an active department in this institute.'})
+            batch = Batch.objects.select_related('program').filter(
+                pk=batch_id,
+                institute=institute,
+                status=AcademicStatus.ACTIVE,
+                program__department=department,
+            ).first()
+            if batch is None:
+                raise serializers.ValidationError({'batch': 'Select an active batch in the selected department.'})
+            subjects = list(Subject.objects.filter(
+                pk__in=subject_ids,
+                institute=institute,
+                department=department,
+                status=AcademicStatus.ACTIVE,
+            ))
+            if len(subjects) != len(subject_ids):
+                raise serializers.ValidationError({
+                    'subject_ids': 'Every selected subject must be active in the selected department and institute.'
+                })
+            attrs['department_object'] = department
+            attrs['batch_object'] = batch
+            attrs['subject_objects'] = subjects
+        elif attrs.get('department') or attrs.get('batch') or attrs.get('subject_ids'):
+            raise serializers.ValidationError({
+                'department': 'Department, batch, and subjects can only be assigned to students.'
+            })
+
+        if identifier and UserInstituteMembership.objects.filter(
+            institute=institute,
+            identifier__iexact=identifier,
+        ).exists():
             raise serializers.ValidationError({'identifier': f"Identifier '{identifier}' is already taken in this institute."})
+        attrs['identifier'] = identifier
 
         return attrs
 
+    @transaction.atomic
     def save(self):
         email = self.validated_data['email'].strip().lower()
         first_name = self.validated_data['first_name']
@@ -376,6 +658,9 @@ class CreateMemberSerializer(serializers.Serializer):
         phone_number = self.validated_data.get('phone_number', '')
         exam_permissions = self.validated_data.get('exam_permissions', [])
         institute = self.context['institute']
+        department = self.validated_data.get('department_object')
+        batch = self.validated_data.get('batch_object')
+        subjects = self.validated_data.get('subject_objects', [])
 
         user, created = User.objects.get_or_create(
             email=email,
@@ -384,14 +669,22 @@ class CreateMemberSerializer(serializers.Serializer):
                 'last_name': last_name,
                 'phone_number': phone_number,
                 'is_active': True,
-                'is_verified': False,
+                'is_verified': True,
                 'must_change_password': True,
             }
         )
-
-        if created:
-            user.set_unusable_password()
-            user.save(update_fields=['password'])
+        password_was_set = created or not user.has_usable_password() or not user.is_verified
+        if password_was_set:
+            user.set_password(self.validated_data['initial_password'])
+            user.is_active = True
+            user.is_verified = True
+            user.must_change_password = True
+            user.save(update_fields=[
+                'password',
+                'is_active',
+                'is_verified',
+                'must_change_password',
+            ])
 
         membership = UserInstituteMembership.objects.create(
             user=user,
@@ -400,9 +693,18 @@ class CreateMemberSerializer(serializers.Serializer):
             identifier=identifier,
             exam_permissions=exam_permissions,
             status=MembershipStatus.ACTIVE,
-            is_verified=False
+            is_verified=True,
         )
+        membership.initial_password_set = password_was_set
+        if role == RoleChoices.STUDENT:
+            from apps.academics.services import configure_student_courses
 
+            configure_student_courses(
+                membership=membership,
+                department=department,
+                batch=batch,
+                subjects=subjects,
+            )
         return membership
 
 

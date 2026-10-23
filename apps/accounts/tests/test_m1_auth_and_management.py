@@ -1,6 +1,8 @@
 import io
 import openpyxl
+from django.core import mail
 from django.urls import reverse
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
@@ -16,8 +18,14 @@ from apps.accounts.models import (
     ImportStatus,
     ImportType,
 )
+from apps.academics.models import Batch, Department, Program, Subject
 
 
+@override_settings(
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+    EMAIL_HOST='smtp.example.test',
+    DEFAULT_FROM_EMAIL='noreply@example.test',
+)
 class M1UserAndAccessManagementTests(APITestCase):
 
     def setUp(self):
@@ -105,6 +113,29 @@ class M1UserAndAccessManagementTests(APITestCase):
             identifier='ROLL001',
             status=MembershipStatus.ACTIVE
         )
+        self.department_alpha = Department.objects.create(
+            institute=self.institute_alpha,
+            code='CSE',
+            name='Computer Science',
+        )
+        self.program_alpha = Program.objects.create(
+            institute=self.institute_alpha,
+            department=self.department_alpha,
+            code='BTECH-CSE',
+            name='Computer Science',
+        )
+        self.batch_alpha = Batch.objects.create(
+            institute=self.institute_alpha,
+            program=self.program_alpha,
+            name='CSE 2026',
+            admission_year=2026,
+        )
+        self.subject_alpha = Subject.objects.create(
+            institute=self.institute_alpha,
+            department=self.department_alpha,
+            code='CS101',
+            name='Programming Fundamentals',
+        )
 
     # --------------------------------------------------------------------------
     # Authentication Tests
@@ -120,7 +151,18 @@ class M1UserAndAccessManagementTests(APITestCase):
         self.assertIn('access', response.data)
         self.assertIn('refresh', response.data)
         self.assertEqual(response.data['user']['email'], 'admin@alpha.edu')
+        self.assertFalse(response.data['user']['is_platform_admin'])
         self.assertFalse(response.data['must_change_password'])
+
+    def test_platform_admin_login_identifies_superuser_without_membership(self):
+        response = self.client.post(reverse('auth-login'), {
+            'email': self.platform_admin.email,
+            'password': 'PlatformAdminPassword123!'
+        })
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['user']['is_platform_admin'])
+        self.assertEqual(response.data['user']['memberships'], [])
 
     def test_invalid_login_credentials_rejected(self):
         url = reverse('auth-login')
@@ -129,6 +171,10 @@ class M1UserAndAccessManagementTests(APITestCase):
             'password': 'WrongPassword999!'
         })
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            response.data['error']['details']['non_field_errors'][0],
+            'Invalid email or password.'
+        )
 
     def test_deactivated_user_cannot_login(self):
         self.alpha_admin.is_active = False
@@ -146,8 +192,17 @@ class M1UserAndAccessManagementTests(APITestCase):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data['email'], 'admin@alpha.edu')
+        self.assertFalse(response.data['is_platform_admin'])
         self.assertEqual(len(response.data['memberships']), 1)
         self.assertEqual(response.data['memberships'][0]['institute_code'], 'ALPHA')
+
+    def test_platform_admin_profile_requires_no_institute_membership(self):
+        self.client.force_authenticate(user=self.platform_admin)
+        response = self.client.get(reverse('auth-me'))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(response.data['is_platform_admin'])
+        self.assertEqual(response.data['memberships'], [])
 
     def test_logout_blacklists_refresh_token(self):
         login_url = reverse('auth-login')
@@ -286,12 +341,24 @@ class M1UserAndAccessManagementTests(APITestCase):
     def test_platform_admin_can_create_institute(self):
         self.client.force_authenticate(user=self.platform_admin)
         url = reverse('institute-list-create')
+        user_count_before = User.objects.count()
+        membership_count_before = UserInstituteMembership.objects.count()
         response = self.client.post(url, {
             'code': 'GAMMA',
             'name': 'Gamma Institute of Science'
         })
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['code'], 'GAMMA')
+        self.assertEqual(User.objects.count(), user_count_before)
+        self.assertEqual(UserInstituteMembership.objects.count(), membership_count_before)
+
+        detail = self.client.get(reverse('institute-detail', kwargs={'institute_id': response.data['id']}))
+        self.assertEqual(detail.status_code, status.HTTP_200_OK)
+        self.assertEqual(detail.data['code'], 'GAMMA')
+        overview = self.client.get(reverse('platform-dashboard-overview'))
+        self.assertEqual(overview.status_code, status.HTTP_200_OK)
+        self.assertEqual(overview.data['total_institutes'], 3)
+        self.assertEqual(overview.data['active_institutes'], 3)
 
     def test_institute_admin_cannot_create_institute(self):
         self.client.force_authenticate(user=self.alpha_admin)
@@ -335,7 +402,8 @@ class M1UserAndAccessManagementTests(APITestCase):
             'first_name': 'Margaret',
             'last_name': 'Hamilton',
             'role': RoleChoices.TEACHER,
-            'identifier': 'FAC099'
+            'identifier': 'FAC099',
+            'initial_password': 'MargaretInitial!45',
         })
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data['role'], RoleChoices.TEACHER)
@@ -344,6 +412,153 @@ class M1UserAndAccessManagementTests(APITestCase):
         list_resp = self.client.get(url)
         self.assertEqual(list_resp.status_code, status.HTTP_200_OK)
         self.assertTrue(any('newteacher@alpha.edu' in str(m) for m in list_resp.data))
+
+    def test_teacher_and_student_members_use_admin_set_password_and_log_in(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        members_url = reverse(
+            'institute-members-list-create',
+            kwargs={'institute_id': self.institute_alpha.id},
+        )
+
+        teacher_response = self.client.post(members_url, {
+            'email': 'activated.teacher@alpha.edu',
+            'first_name': 'Activated',
+            'last_name': 'Teacher',
+            'role': RoleChoices.TEACHER,
+            'identifier': 'FAC100',
+            'initial_password': 'TeacherInitial!45',
+        })
+        self.assertEqual(teacher_response.status_code, status.HTTP_201_CREATED)
+        teacher_user = User.objects.get(email='activated.teacher@alpha.edu')
+        self.assertTrue(teacher_user.is_active)
+        self.assertTrue(teacher_user.is_verified)
+        self.assertTrue(teacher_user.must_change_password)
+        self.assertTrue(teacher_user.check_password('TeacherInitial!45'))
+        self.assertTrue(teacher_response.data['initial_password_set'])
+        self.assertNotIn('initial_password', teacher_response.data)
+        self.assertNotIn('TeacherInitial!45', str(teacher_response.data))
+        self.assertEqual(len(mail.outbox), 0)
+        teacher_login = self.client.post(reverse('auth-login'), {
+            'email': 'activated.teacher@alpha.edu',
+            'password': 'TeacherInitial!45',
+        })
+        self.assertEqual(teacher_login.status_code, status.HTTP_200_OK)
+        self.assertTrue(teacher_login.data['must_change_password'])
+        self.assertEqual(
+            teacher_login.data['user']['memberships'][0]['role'],
+            RoleChoices.TEACHER,
+        )
+        self.assertEqual(
+            UserInstituteMembership.objects.get(user__email='activated.teacher@alpha.edu').status,
+            MembershipStatus.ACTIVE,
+        )
+
+        student_response = self.client.post(members_url, {
+            'email': 'activated.student@alpha.edu',
+            'first_name': 'Activated',
+            'last_name': 'Student',
+            'role': RoleChoices.STUDENT,
+            'identifier': 'ROLL100',
+            'department': str(self.department_alpha.id),
+            'batch': str(self.batch_alpha.id),
+            'subject_ids': [str(self.subject_alpha.id)],
+            'initial_password': 'StudentInitial!45',
+        })
+        self.assertEqual(student_response.status_code, status.HTTP_201_CREATED)
+        student_membership = UserInstituteMembership.objects.get(
+            user__email='activated.student@alpha.edu',
+            institute=self.institute_alpha,
+        )
+        self.assertEqual(student_membership.subject_enrollments.filter(status='active').count(), 1)
+        student_user = User.objects.get(email='activated.student@alpha.edu')
+        self.assertTrue(student_user.is_active)
+        self.assertTrue(student_user.is_verified)
+        self.assertTrue(student_user.must_change_password)
+        self.assertTrue(student_user.check_password('StudentInitial!45'))
+        self.assertEqual(len(mail.outbox), 0)
+        student_login = self.client.post(reverse('auth-login'), {
+            'email': 'activated.student@alpha.edu',
+            'password': 'StudentInitial!45',
+        })
+        self.assertEqual(student_login.status_code, status.HTTP_200_OK)
+        self.assertTrue(student_login.data['must_change_password'])
+        self.assertEqual(
+            student_login.data['user']['memberships'][0]['role'],
+            RoleChoices.STUDENT,
+        )
+        student_membership.refresh_from_db()
+        self.assertEqual(student_membership.status, MembershipStatus.ACTIVE)
+
+    def test_member_creation_works_without_smtp_and_requires_strong_initial_password(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        with override_settings(EMAIL_HOST='', DEFAULT_FROM_EMAIL=''):
+            response = self.client.post(
+                reverse(
+                    'institute-members-list-create',
+                    kwargs={'institute_id': self.institute_alpha.id},
+                ),
+                {
+                    'email': 'no.activation@alpha.edu',
+                    'first_name': 'No',
+                    'last_name': 'Activation',
+                    'role': RoleChoices.TEACHER,
+                    'initial_password': 'SecureInitial!58',
+                },
+            )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        account = User.objects.get(email='no.activation@alpha.edu')
+        self.assertTrue(account.check_password('SecureInitial!58'))
+        self.assertEqual(response.data['initial_password_set'], True)
+        self.assertEqual(len(mail.outbox), 0)
+
+        weak_response = self.client.post(
+            reverse(
+                'institute-members-list-create',
+                kwargs={'institute_id': self.institute_alpha.id},
+            ),
+            {
+                'email': 'weak.password@alpha.edu',
+                'first_name': 'Weak',
+                'last_name': 'Password',
+                'role': RoleChoices.TEACHER,
+                'initial_password': '12345678',
+            },
+        )
+        self.assertEqual(weak_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(User.objects.filter(email='weak.password@alpha.edu').exists())
+
+    def test_adding_existing_account_does_not_overwrite_its_password(self):
+        existing = User.objects.create_user(
+            email='existing@beta.edu',
+            password='ExistingAccount!45',
+            is_active=True,
+            is_verified=True,
+        )
+        UserInstituteMembership.objects.create(
+            user=existing,
+            institute=self.institute_beta,
+            role=RoleChoices.TEACHER,
+            status=MembershipStatus.ACTIVE,
+        )
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(
+            reverse(
+                'institute-members-list-create',
+                kwargs={'institute_id': self.institute_alpha.id},
+            ),
+            {
+                'email': existing.email,
+                'first_name': 'Existing',
+                'last_name': 'Account',
+                'role': RoleChoices.TEACHER,
+                'initial_password': 'NotReplacing!45',
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        self.assertFalse(response.data['initial_password_set'])
+        existing.refresh_from_db()
+        self.assertTrue(existing.check_password('ExistingAccount!45'))
+        self.assertFalse(existing.check_password('NotReplacing!45'))
 
     def test_membership_patch_cannot_change_user_or_institute(self):
         membership = UserInstituteMembership.objects.get(
@@ -411,12 +626,12 @@ class M1UserAndAccessManagementTests(APITestCase):
 
     def test_bulk_csv_import_validation_and_confirmation(self):
         csv_content = (
-            "email,first_name,last_name,identifier\n"
-            "student_valid_1@alpha.edu,John,Doe,S101\n"
-            "student_valid_2@alpha.edu,Jane,Smith,S102\n"
-            "invalid-email-row,Bad,Email,S103\n"
-            "student@alpha.edu,Existing,Student,ROLL001\n"
-            "student_valid_1@alpha.edu,Duplicate,InFile,S105\n"
+            "email,first_name,last_name,identifier,department_code,batch_name,subject_codes\n"
+            "student_valid_1@alpha.edu,John,Doe,S101,CSE,CSE 2026,CS101\n"
+            "student_valid_2@alpha.edu,Jane,Smith,S102,CSE,CSE 2026,CS101\n"
+            "invalid-email-row,Bad,Email,S103,CSE,CSE 2026,CS101\n"
+            "student@alpha.edu,Existing,Student,ROLL001,CSE,CSE 2026,CS101\n"
+            "student_valid_1@alpha.edu,Duplicate,InFile,S105,CSE,CSE 2026,CS101\n"
         )
         csv_file = io.BytesIO(csv_content.encode('utf-8'))
         csv_file.name = 'students_batch.csv'
@@ -463,6 +678,49 @@ class M1UserAndAccessManagementTests(APITestCase):
         m1 = UserInstituteMembership.objects.get(user=u1, institute=self.institute_alpha)
         self.assertEqual(m1.role, RoleChoices.STUDENT)
         self.assertEqual(m1.identifier, 'S101')
+        self.assertEqual(m1.academic_placements.filter(status='active').count(), 1)
+        self.assertEqual(m1.subject_enrollments.filter(status='active').count(), 1)
+
+    def test_bulk_import_detects_duplicates_even_when_first_row_has_other_errors(self):
+        csv_content = (
+            'email,first_name,last_name,roll_number,department_code,batch_name,subject_codes\n'
+            ',,First Invalid,DUP100,CSE,CSE 2026,CS101\n'
+            'repeat@alpha.edu,Second,Row,DUP200,CSE,CSE 2026,CS101\n'
+            'repeat@alpha.edu,Third,Row,DUP300,CSE,CSE 2026,CS101\n'
+            'unique@alpha.edu,Fourth,Row,DUP100,CSE,CSE 2026,CS101\n'
+        )
+        csv_file = io.BytesIO(csv_content.encode('utf-8'))
+        csv_file.name = 'duplicate_students.csv'
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(
+            reverse('institute-import-upload', kwargs={'institute_id': self.institute_alpha.id}),
+            {'file': csv_file, 'import_type': 'students'},
+            format='multipart',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['valid_rows'], 1)
+        self.assertEqual(response.data['error_rows'], 3)
+
+        errors = response.data['row_errors']
+        codes = {(error['row_number'], error['error_code']) for error in errors}
+        self.assertIn((4, 'duplicate_in_file'), codes)
+        self.assertIn((5, 'duplicate_identifier_in_file'), codes)
+
+    def test_malformed_xlsx_is_reported_as_a_file_error(self):
+        invalid_file = io.BytesIO(b'not an xlsx archive')
+        invalid_file.name = 'students.xlsx'
+        self.client.force_authenticate(user=self.alpha_admin)
+
+        response = self.client.post(
+            reverse('institute-import-upload', kwargs={'institute_id': self.institute_alpha.id}),
+            {'file': invalid_file, 'import_type': 'students'},
+            format='multipart',
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data['status'], ImportStatus.FAILED)
+        self.assertEqual(response.data['error_rows'], 1)
+        self.assertEqual(response.data['row_errors'][0]['error_code'], 'invalid_file')
 
     def test_bulk_excel_import_validation(self):
         wb = openpyxl.Workbook()

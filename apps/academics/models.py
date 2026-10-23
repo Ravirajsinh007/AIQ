@@ -70,9 +70,10 @@ class Program(models.Model):
     department = models.ForeignKey(Department, on_delete=models.CASCADE, related_name='programs')
     code = models.CharField(max_length=50, db_index=True)
     name = models.CharField(max_length=255)
-    qualification_type = models.CharField(max_length=50, choices=QualificationType.choices, default=QualificationType.UNDERGRADUATE)
-    duration_years = models.PositiveIntegerField(default=4)
-    total_semesters = models.PositiveIntegerField(default=8)
+    qualification_type = models.CharField(max_length=50, choices=QualificationType.choices, default=QualificationType.UNDERGRADUATE, blank=True)
+    duration_years = models.PositiveIntegerField(default=4, null=True, blank=True)
+    total_semesters = models.PositiveIntegerField(default=8, null=True, blank=True)
+    is_department_mapping = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=AcademicStatus.choices, default=AcademicStatus.ACTIVE, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -149,7 +150,11 @@ class Semester(models.Model):
         verbose_name_plural = 'Semesters'
 
     def clean(self):
-        if self.program_id and self.semester_number > self.program.total_semesters:
+        if (
+            self.program_id
+            and self.program.total_semesters is not None
+            and self.semester_number > self.program.total_semesters
+        ):
             raise ValidationError(f"Semester number {self.semester_number} exceeds program's total semesters ({self.program.total_semesters}).")
 
     def save(self, *args, **kwargs):
@@ -467,7 +472,13 @@ class TeacherAssignment(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     teacher = models.ForeignKey(UserInstituteMembership, on_delete=models.CASCADE, related_name='teaching_assignments')
     subject = models.ForeignKey(Subject, on_delete=models.CASCADE, related_name='teacher_assignments')
-    academic_year = models.ForeignKey(AcademicYear, on_delete=models.CASCADE, related_name='teacher_assignments')
+    academic_year = models.ForeignKey(
+        AcademicYear,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='teacher_assignments',
+    )
     batch = models.ForeignKey(Batch, on_delete=models.SET_NULL, null=True, blank=True, related_name='teacher_assignments')
     section = models.ForeignKey(Section, on_delete=models.SET_NULL, null=True, blank=True, related_name='teacher_assignments')
     status = models.CharField(max_length=20, choices=AssignmentStatus.choices, default=AssignmentStatus.ACTIVE, db_index=True)
@@ -502,7 +513,8 @@ class TeacherAssignment(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.teacher.user.email} -> {self.subject.code} ({self.academic_year.label})"
+        academic_year = self.academic_year.label if self.academic_year_id else 'all academic years'
+        return f"{self.teacher.user.email} -> {self.subject.code} ({academic_year})"
 
 
 class StudentAcademicPlacement(models.Model):
@@ -515,7 +527,13 @@ class StudentAcademicPlacement(models.Model):
     student = models.ForeignKey(UserInstituteMembership, on_delete=models.CASCADE, related_name='academic_placements')
     program = models.ForeignKey(Program, on_delete=models.CASCADE, related_name='student_placements')
     batch = models.ForeignKey(Batch, on_delete=models.CASCADE, related_name='student_placements')
-    semester = models.ForeignKey(Semester, on_delete=models.CASCADE, related_name='student_placements')
+    semester = models.ForeignKey(
+        Semester,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='student_placements',
+    )
     section = models.ForeignKey(Section, on_delete=models.SET_NULL, null=True, blank=True, related_name='student_placements')
     effective_start_date = models.DateField(default=timezone.localdate)
     effective_end_date = models.DateField(null=True, blank=True)
@@ -557,4 +575,67 @@ class StudentAcademicPlacement(models.Model):
         super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.student.user.email} - {self.program.code} - {self.semester.label} ({self.status})"
+        semester = self.semester.label if self.semester_id else 'no term specified'
+        return f"{self.student.user.email} - {self.program.code} - {semester} ({self.status})"
+
+
+class StudentSubjectEnrollment(models.Model):
+    """
+    Explicit subject enrollment for a student within their assigned batch.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    student = models.ForeignKey(
+        UserInstituteMembership,
+        on_delete=models.CASCADE,
+        related_name='subject_enrollments',
+    )
+    batch = models.ForeignKey(
+        Batch,
+        on_delete=models.CASCADE,
+        related_name='student_subject_enrollments',
+    )
+    subject = models.ForeignKey(
+        Subject,
+        on_delete=models.CASCADE,
+        related_name='student_enrollments',
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=[
+            (AcademicStatus.ACTIVE, 'Active'),
+            (AcademicStatus.INACTIVE, 'Inactive'),
+        ],
+        default=AcademicStatus.ACTIVE,
+        db_index=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'academics_student_subject_enrollment'
+        unique_together = ('student', 'batch', 'subject')
+        ordering = ['subject__code']
+        indexes = [
+            models.Index(fields=['student', 'batch', 'status']),
+            models.Index(fields=['subject', 'status']),
+        ]
+
+    def clean(self):
+        if self.student_id:
+            if self.student.role != RoleChoices.STUDENT:
+                raise ValidationError('Only student memberships can enroll in subjects.')
+            if self.student.institute_id != self.batch.institute_id:
+                raise ValidationError('Student and batch must belong to the same institute.')
+            if self.student.institute_id != self.subject.institute_id:
+                raise ValidationError('Student and subject must belong to the same institute.')
+        if self.batch_id and self.subject_id:
+            department_id = self.batch.program.department_id
+            if self.subject.department_id != department_id:
+                raise ValidationError('Subject must belong to the batch’s department.')
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.student.identifier} - {self.batch.name} - {self.subject.code}'

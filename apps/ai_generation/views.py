@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from django.db import transaction
+from django.db.models import Q
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 from apps.accounts.permissions import EnforcePasswordChange
 from .permissions import CanManageSourceMaterials, CanGenerateQuestions, can_access_institute
@@ -57,11 +58,21 @@ class SourceDocumentViewSet(viewsets.ModelViewSet):
                 'institute', 'subject', 'unit', 'topic', 'uploaded_by'
             ).prefetch_related('chunks')
 
-        user_institutes = user.memberships.filter(
+        memberships = user.memberships.filter(
             role__in=['institute_admin', 'teacher', 'exam_staff'],
             status='active',
+        )
+        user_institutes = memberships.filter(
+            role__in=['institute_admin', 'exam_staff']
         ).values_list('institute_id', flat=True)
-        return SourceDocument.objects.filter(institute_id__in=user_institutes).select_related(
+        teacher_subjects = user.memberships.filter(
+            role='teacher',
+            status='active',
+            teaching_assignments__status='active',
+        ).values_list('teaching_assignments__subject_id', flat=True)
+        return SourceDocument.objects.filter(
+            Q(institute_id__in=user_institutes) | Q(subject_id__in=teacher_subjects)
+        ).select_related(
             'institute', 'subject', 'unit', 'topic', 'uploaded_by'
         ).prefetch_related('chunks')
 
@@ -78,6 +89,25 @@ class SourceDocumentViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied('You are not authorized to upload source material for this institute.')
+        is_institute_manager = request.user.memberships.filter(
+            institute=serializer.validated_data['institute'],
+            role__in=['institute_admin', 'exam_staff'],
+            status='active',
+        ).exists()
+        if not request.user.is_platform_admin and not is_institute_manager and request.user.memberships.filter(
+            institute=serializer.validated_data['institute'],
+            role='teacher',
+            status='active',
+        ).exists() and not request.user.memberships.filter(
+            institute=serializer.validated_data['institute'],
+            role='teacher',
+            status='active',
+            teaching_assignments__subject=serializer.validated_data['subject'],
+            teaching_assignments__status='active',
+        ).exists():
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied('Teachers can upload material only for subjects they are actively assigned to teach.')
         with transaction.atomic():
             instance = serializer.save(
                 uploaded_by=request.user,
@@ -184,11 +214,21 @@ class QuestionGenerationJobViewSet(viewsets.ModelViewSet):
                 'institute', 'subject', 'unit', 'topic', 'learning_outcome', 'requested_by'
             ).prefetch_related('source_documents', 'candidates')
 
-        user_institutes = user.memberships.filter(
+        memberships = user.memberships.filter(
             role__in=['institute_admin', 'teacher', 'exam_staff'],
             status='active',
+        )
+        user_institutes = memberships.filter(
+            role__in=['institute_admin', 'exam_staff']
         ).values_list('institute_id', flat=True)
-        return QuestionGenerationJob.objects.filter(institute_id__in=user_institutes).select_related(
+        teacher_subjects = user.memberships.filter(
+            role='teacher',
+            status='active',
+            teaching_assignments__status='active',
+        ).values_list('teaching_assignments__subject_id', flat=True)
+        return QuestionGenerationJob.objects.filter(
+            Q(institute_id__in=user_institutes) | Q(subject_id__in=teacher_subjects)
+        ).select_related(
             'institute', 'subject', 'unit', 'topic', 'learning_outcome', 'requested_by'
         ).prefetch_related('source_documents', 'candidates')
 
@@ -204,6 +244,25 @@ class QuestionGenerationJobViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
 
             raise PermissionDenied('You are not authorized to generate questions for this institute.')
+        is_institute_manager = request.user.memberships.filter(
+            institute=data['institute'],
+            role__in=['institute_admin', 'exam_staff'],
+            status='active',
+        ).exists()
+        if not request.user.is_platform_admin and not is_institute_manager and request.user.memberships.filter(
+            institute=data['institute'],
+            role='teacher',
+            status='active',
+        ).exists() and not request.user.memberships.filter(
+            institute=data['institute'],
+            role='teacher',
+            status='active',
+            teaching_assignments__subject=data['subject'],
+            teaching_assignments__status='active',
+        ).exists():
+            from rest_framework.exceptions import PermissionDenied
+
+            raise PermissionDenied('Teachers can generate questions only for subjects they are actively assigned to teach.')
 
         source_docs = data.pop('source_document_ids', [])
 

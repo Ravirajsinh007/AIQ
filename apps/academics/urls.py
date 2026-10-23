@@ -22,6 +22,7 @@ from .views import (
     OutcomeAttainmentView,
     LearningSupportRecommendationsView,
     StudentRiskIndicatorsView,
+    InstituteAdminDashboardView,
 )
 
 router = DefaultRouter()
@@ -45,6 +46,7 @@ router.register(r'student-placements', StudentAcademicPlacementViewSet, basename
 
 urlpatterns = [
     path('', include(router.urls)),
+    path('institute-admin/dashboard/', InstituteAdminDashboardView.as_view(), name='institute-admin-dashboard'),
     path('student-placements/<uuid:placement_id>/progress/', StudentProgressionView.as_view(), name='student-placement-progress'),
     path('outcome-attainment/', OutcomeAttainmentView.as_view(), name='outcome-attainment'),
     path('learning-support/recommendations/', LearningSupportRecommendationsView.as_view(), name='learning-support-recommendations'),

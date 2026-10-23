@@ -1,6 +1,10 @@
 from django.shortcuts import get_object_or_404
 from django.db import transaction
+from django.db.models import Count, Prefetch, Q
+from django.db.models.functions import TruncMonth
+from django.utils import timezone
 from rest_framework import status, generics
+from rest_framework.exceptions import ValidationError
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -13,6 +17,7 @@ from .models import (
     User,
     UserInstituteMembership,
     RoleChoices,
+    InstituteStatus,
     MembershipStatus,
     BulkImportJob,
     ImportStatus,
@@ -224,17 +229,33 @@ class InstituteListCreateView(generics.ListCreateAPIView):
 
     def get_permissions(self):
         if self.request.method == 'POST':
-            return [IsPlatformAdmin()]
+            return [IsAuthenticated(), EnforcePasswordChange(), IsPlatformAdmin()]
         return [IsAuthenticated(), EnforcePasswordChange()]
 
     def get_queryset(self):
         user = self.request.user
         if user.is_platform_admin:
-            return Institute.objects.all().order_by('name')
-        return Institute.objects.filter(
-            memberships__user=user,
-            memberships__status=MembershipStatus.ACTIVE
-        ).distinct().order_by('name')
+            institutes = Institute.objects.all()
+        else:
+            institutes = Institute.objects.filter(
+                memberships__user=user,
+                memberships__status=MembershipStatus.ACTIVE
+            ).distinct()
+
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            valid_statuses = {value for value, _label in InstituteStatus.choices}
+            if status_filter not in valid_statuses:
+                raise ValidationError({'status': 'Select a valid institute status.'})
+            institutes = institutes.filter(status=status_filter)
+
+        search = self.request.query_params.get('search', '').strip()
+        if search:
+            institutes = institutes.filter(Q(name__icontains=search) | Q(code__icontains=search))
+        ordering = self.request.query_params.get('ordering', 'name')
+        if ordering not in {'name', '-created_at'}:
+            raise ValidationError({'ordering': 'Use name or -created_at.'})
+        return institutes.order_by(ordering)
 
     @transaction.atomic
     def perform_create(self, serializer):
@@ -294,12 +315,74 @@ class InstituteDetailView(generics.RetrieveUpdateAPIView):
         return super().patch(request, *args, **kwargs)
 
 
+class PlatformDashboardOverviewView(APIView):
+    permission_classes = [IsAuthenticated, EnforcePasswordChange, IsPlatformAdmin]
+
+    @staticmethod
+    def _monthly_counts(queryset, field):
+        rows = (
+            queryset.annotate(month=TruncMonth(field))
+            .values('month')
+            .annotate(total=Count('id'))
+            .order_by('month')
+        )
+        return {
+            row['month'].strftime('%Y-%m'): row['total']
+            for row in rows
+            if row['month'] is not None
+        }
+
+    def get(self, request):
+        institute_counts = Institute.objects.aggregate(
+            total=Count('id'),
+            active=Count('id', filter=Q(status=InstituteStatus.ACTIVE)),
+        )
+        user_counts = User.objects.aggregate(
+            total=Count('id'),
+            active=Count('id', filter=Q(is_active=True)),
+        )
+
+        institutes_by_month = self._monthly_counts(Institute.objects.all(), 'created_at')
+        users_by_month = self._monthly_counts(User.objects.all(), 'created_at')
+        month_keys = [*institutes_by_month, *users_by_month]
+        growth = []
+        if month_keys:
+            first_year, first_month = min(
+                (int(key[:4]), int(key[5:7])) for key in month_keys
+            )
+            today = timezone.localdate()
+            year, month = first_year, first_month
+            institute_total = 0
+            user_total = 0
+            while (year, month) <= (today.year, today.month):
+                month_key = f'{year:04d}-{month:02d}'
+                institute_total += institutes_by_month.get(month_key, 0)
+                user_total += users_by_month.get(month_key, 0)
+                growth.append({
+                    'month': month_key,
+                    'institutes': institute_total,
+                    'users': user_total,
+                })
+                if month == 12:
+                    year, month = year + 1, 1
+                else:
+                    month += 1
+
+        return Response({
+            'total_institutes': institute_counts['total'],
+            'active_institutes': institute_counts['active'],
+            'total_users': user_counts['total'],
+            'active_users': user_counts['active'],
+            'growth': growth,
+        })
+
+
 class ProvisionAdminView(APIView):
     """
     Provisions the first Institute Administrator for an institute.
     Strictly restricted to Platform Administrators.
     """
-    permission_classes = [IsPlatformAdmin]
+    permission_classes = [IsAuthenticated, EnforcePasswordChange, IsPlatformAdmin]
 
     @extend_schema(
         summary="Provision Institute Administrator (Platform Admin Only)",
@@ -346,7 +429,33 @@ class InstituteMemberListCreateView(APIView):
     )
     def get(self, request, institute_id):
         institute = get_object_or_404(Institute, id=institute_id)
-        memberships = UserInstituteMembership.objects.filter(institute=institute).select_related('user', 'institute')
+        from apps.academics.models import (
+            AcademicStatus,
+            PlacementStatus,
+            StudentAcademicPlacement,
+            StudentSubjectEnrollment,
+        )
+
+        memberships = UserInstituteMembership.objects.filter(institute=institute).select_related(
+            'user', 'institute'
+        ).prefetch_related(
+            Prefetch(
+                'academic_placements',
+                queryset=StudentAcademicPlacement.objects.filter(
+                    status=PlacementStatus.ACTIVE,
+                    effective_end_date__isnull=True,
+                    effective_start_date__lte=timezone.localdate(),
+                ).select_related('program__department', 'batch').order_by('-created_at'),
+                to_attr='_current_academic_placements',
+            ),
+            Prefetch(
+                'subject_enrollments',
+                queryset=StudentSubjectEnrollment.objects.filter(
+                    status=AcademicStatus.ACTIVE,
+                ).select_related('subject').order_by('subject__code'),
+                to_attr='_active_subject_enrollments',
+            ),
+        )
 
         # Filter by role
         role = request.query_params.get('role')
@@ -392,10 +501,9 @@ class InstituteMemberListCreateView(APIView):
                 institute=institute,
                 metadata={'role': membership.role, 'membership_status': membership.status},
             )
-        return Response(
-            UserInstituteMembershipSerializer(membership).data,
-            status=status.HTTP_201_CREATED
-        )
+        response_data = UserInstituteMembershipSerializer(membership).data
+        response_data['initial_password_set'] = membership.initial_password_set
+        return Response(response_data, status=status.HTTP_201_CREATED)
 
 
 class InstituteMemberDetailView(APIView):

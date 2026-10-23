@@ -48,20 +48,29 @@ class CanManageQuestions(permissions.BasePermission):
             institute_id = obj.question.institute_id
 
         # Verify membership in this institute
-        membership = request.user.memberships.filter(
+        manager_membership = request.user.memberships.filter(
             institute_id=institute_id,
-            role__in=[RoleChoices.TEACHER, RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
             status=MembershipStatus.ACTIVE
         ).first()
 
-        if not membership:
-            return False
-
-        # Institute Admins and Exam Staff have full operational access in their institute
-        if membership.role in [RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF]:
+        if manager_membership:
             return True
 
-        if membership.role != RoleChoices.TEACHER:
+        membership = request.user.memberships.filter(
+            institute_id=institute_id,
+            role=RoleChoices.TEACHER,
+            status=MembershipStatus.ACTIVE,
+        ).first()
+        if membership is None:
+            return False
+        subject_id = getattr(obj, 'subject_id', None)
+        if subject_id is None and hasattr(obj, 'question'):
+            subject_id = obj.question.subject_id
+        if not membership.teaching_assignments.filter(
+            subject_id=subject_id,
+            status='active',
+        ).exists():
             return False
 
         if request.method in permissions.SAFE_METHODS:

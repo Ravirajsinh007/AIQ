@@ -17,6 +17,32 @@ from apps.accounts.models import MembershipStatus, RoleChoices
 from apps.accounts.permissions import EnforcePasswordChange
 from apps.academics.models import StudentAcademicPlacement, PlacementStatus
 
+
+def _teacher_exam_scope(user):
+    from apps.academics.models import TeacherAssignment
+
+    assignments = TeacherAssignment.objects.filter(
+        teacher__user=user,
+        teacher__role=RoleChoices.TEACHER,
+        teacher__status=MembershipStatus.ACTIVE,
+        status='active',
+    ).select_related('subject')
+    scope = Q(pk__in=[])
+    found_assignment = False
+    for assignment in assignments:
+        found_assignment = True
+        assignment_scope = Q(
+            institute_id=assignment.subject.institute_id,
+            paper__subject_id=assignment.subject_id,
+        )
+        if assignment.batch_id:
+            assignment_scope &= Q(batch_id=assignment.batch_id)
+        if assignment.section_id:
+            assignment_scope &= Q(section_id=assignment.section_id)
+        scope |= assignment_scope
+    return scope if found_assignment else None
+
+
 from .models import (
     ExamActivityEvent,
     ExamActivitySource,
@@ -228,6 +254,17 @@ class ExamScheduleViewSet(viewsets.ModelViewSet):
             if manager_institutes:
                 return (student_schedules | schedules.filter(institute_id__in=manager_institutes)).distinct()
             return student_schedules.distinct()
+        if self.action in {'list', 'retrieve'}:
+            teacher_scope = _teacher_exam_scope(user)
+            teacher_schedules = (
+                schedules.filter(teacher_scope) if teacher_scope is not None
+                else schedules.none()
+            )
+            if manager_institutes:
+                teacher_schedules = teacher_schedules | schedules.filter(
+                    institute_id__in=manager_institutes
+                )
+            return teacher_schedules.distinct()
         return schedules.filter(institute_id__in=manager_institutes).distinct()
 
     def get_serializer_class(self):
@@ -249,13 +286,27 @@ class ExamScheduleViewSet(viewsets.ModelViewSet):
                     role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
                 )
             )
-            return ExamScheduleSerializer if has_manager_role and not has_student_role else ExamStudentSerializer
+            has_teacher_role = user.memberships.filter(
+                role=RoleChoices.TEACHER,
+                status=MembershipStatus.ACTIVE,
+            ).exists()
+            return (
+                ExamScheduleSerializer
+                if (has_manager_role or has_teacher_role) and not has_student_role
+                else ExamStudentSerializer
+            )
         institute_id = self.request.data.get('institute')
         if not institute_id and self.kwargs.get('pk'):
             institute_id = ExamSchedule.objects.filter(pk=self.kwargs['pk']).values_list(
                 'institute_id', flat=True
             ).first()
-        if is_exam_manager(user, institute_id):
+        if is_exam_manager(user, institute_id) or (
+            self.action == 'retrieve'
+            and user.memberships.filter(
+                role=RoleChoices.TEACHER,
+                status=MembershipStatus.ACTIVE,
+            ).exists()
+        ):
             return ExamScheduleSerializer
         return ExamStudentSerializer
 
@@ -1023,8 +1074,23 @@ class ExamAnalyticsView(APIView):
                 or {'controller', 'exam_admin', 'exam_manager'} & set(membership.exam_permissions or [])
             ]
             if not managed_ids:
-                raise PermissionDenied('Examination analytics requires exam management permission.')
-            schedules = schedules.filter(institute_id__in=managed_ids)
+                teacher_scope = _teacher_exam_scope(user)
+                if teacher_scope is None:
+                    raise PermissionDenied('Examination analytics requires an active exam management permission or teaching assignment.')
+                schedules = schedules.filter(teacher_scope)
+            else:
+                teacher_membership = user.memberships.filter(
+                    status=MembershipStatus.ACTIVE,
+                    role=RoleChoices.TEACHER,
+                )
+                if teacher_membership.exists():
+                    teacher_scope = _teacher_exam_scope(user)
+                    if teacher_scope is not None:
+                        schedules = schedules.filter(
+                            Q(institute_id__in=managed_ids) | teacher_scope
+                        )
+                else:
+                    schedules = schedules.filter(institute_id__in=managed_ids)
         if 'institute' in validated_filters:
             schedules = schedules.filter(institute_id=validated_filters['institute'])
         if 'batch' in validated_filters:

@@ -48,20 +48,21 @@ class CanManageBlueprints(permissions.BasePermission):
         if not institute_id and hasattr(obj, 'section'):
             institute_id = obj.section.blueprint.institute_id
 
-        membership = request.user.memberships.filter(
+        manager_membership = request.user.memberships.filter(
             institute_id=institute_id,
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
             status=MembershipStatus.ACTIVE
         ).first()
 
-        if not membership:
-            return False
-
-        # Institute Admins & Exam Staff have full operational access
-        if membership.role in [RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF]:
+        if manager_membership:
             return True
 
-        # Teachers: check assigned subject
-        if membership.role == RoleChoices.TEACHER:
+        membership = request.user.memberships.filter(
+            institute_id=institute_id,
+            role=RoleChoices.TEACHER,
+            status=MembershipStatus.ACTIVE,
+        ).first()
+        if membership is not None:
             subject = getattr(obj, 'subject', None)
             if not subject and hasattr(obj, 'blueprint'):
                 subject = obj.blueprint.subject
@@ -74,17 +75,8 @@ class CanManageBlueprints(permissions.BasePermission):
                     subject=subject,
                     status='active'
                 ).exists()
-                # Or if teacher is the author of the blueprint
-                is_author = getattr(obj, 'created_by_id', None) == request.user.id
-                if hasattr(obj, 'blueprint') and obj.blueprint.created_by_id == request.user.id:
-                    is_author = True
-                if hasattr(obj, 'section') and obj.section.blueprint.created_by_id == request.user.id:
-                    is_author = True
+                return is_assigned
 
-                if is_assigned or is_author:
-                    return True
-                return False
-
-            return True
+            return False
 
         return False

@@ -61,7 +61,7 @@ class GoogleGeminiProvider(BaseAIProvider):
 
     def __init__(self, api_key: str | None = None, model_name: str | None = None):
         self.api_key = api_key or getattr(settings, 'GEMINI_API_KEY', '')
-        self.model_name = model_name or getattr(settings, 'GEMINI_MODEL', 'gemini-2.5-flash')
+        self.model_name = model_name or getattr(settings, 'GEMINI_MODEL', 'gemini-3.8-flash')
 
         if not self.api_key or not self.api_key.strip():
             raise AIConfigurationError(

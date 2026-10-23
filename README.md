@@ -81,7 +81,7 @@ DATABASE_URL="postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supaba
 
 # Google Gemini API Key
 GEMINI_API_KEY="your-gemini-api-key"
-GEMINI_MODEL="gemini-2.5-flash"
+GEMINI_MODEL="gemini-3.8-flash"
 ```
 
 ### 3.3 Apply Migrations & Verify

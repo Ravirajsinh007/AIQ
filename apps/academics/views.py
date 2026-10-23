@@ -2,7 +2,7 @@ from decimal import Decimal
 from django.shortcuts import get_object_or_404
 from rest_framework import serializers, viewsets, status
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -11,7 +11,15 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 from apps.accounts.permissions import EnforcePasswordChange
 from .permissions import IsInstituteAcademicAdmin
-from apps.accounts.models import MembershipStatus, RoleChoices, UserInstituteMembership
+from apps.accounts.models import (
+    Institute,
+    MembershipStatus,
+    RoleChoices,
+    User,
+    UserInstituteMembership,
+)
+from apps.audit.models import AuditEvent
+from apps.exams.models import ExamSchedule, ExamScheduleStatus
 from .models import (
     Department,
     Program,
@@ -52,6 +60,129 @@ from .serializers import (
     StudentAcademicPlacementSerializer,
     StudentProgressionSerializer,
 )
+
+
+def managed_institute_ids(user):
+    return user.memberships.filter(
+        role=RoleChoices.INSTITUTE_ADMIN,
+        status=MembershipStatus.ACTIVE,
+    ).values_list('institute_id', flat=True)
+
+
+def active_institute_ids(user):
+    return user.memberships.filter(
+        status=MembershipStatus.ACTIVE,
+    ).values_list('institute_id', flat=True)
+
+
+class InstituteAdminDashboardView(APIView):
+    permission_classes = [IsAuthenticated, EnforcePasswordChange]
+
+    def get(self, request):
+        managed_ids = managed_institute_ids(request.user)
+        institute_id = request.query_params.get('institute')
+        if institute_id:
+            try:
+                institute_id = serializers.UUIDField().run_validation(institute_id)
+            except serializers.ValidationError as exc:
+                raise ValidationError({'institute': exc.detail}) from exc
+            if not managed_ids.filter(institute_id=institute_id).exists():
+                raise PermissionDenied('Institute administrator access is required for this institute.')
+        else:
+            institute_ids = list(managed_ids)
+            if len(institute_ids) != 1:
+                raise ValidationError({'institute': 'Select one active institute membership.'})
+            institute_id = institute_ids[0]
+
+        institute = get_object_or_404(Institute, pk=institute_id)
+        memberships = UserInstituteMembership.objects.filter(
+            institute_id=institute_id,
+            status=MembershipStatus.ACTIVE,
+        )
+        exam_schedules = ExamSchedule.objects.filter(institute_id=institute_id)
+        upcoming = exam_schedules.filter(
+            status=ExamScheduleStatus.SCHEDULED,
+            starts_at__gte=timezone.now(),
+        ).select_related('paper', 'batch').order_by('starts_at')[:5]
+
+        latest_members = memberships.select_related('user').filter(
+            role__in=[RoleChoices.TEACHER, RoleChoices.STUDENT],
+        ).order_by('-created_at')
+        recent_teachers = [
+            {
+                'id': str(member.id),
+                'name': member.user.full_name,
+                'identifier': member.identifier,
+                'created_at': member.created_at,
+            }
+            for member in latest_members.filter(role=RoleChoices.TEACHER)[:5]
+        ]
+        recent_students = [
+            {
+                'id': str(member.id),
+                'name': member.user.full_name,
+                'identifier': member.identifier,
+                'created_at': member.created_at,
+            }
+            for member in latest_members.filter(role=RoleChoices.STUDENT)[:5]
+        ]
+        activity = list(
+            AuditEvent.objects.filter(institute_id=institute_id)
+            .order_by('-created_at')
+            .values('id', 'action', 'resource_type', 'outcome', 'created_at')[:5]
+        )
+        student_distribution = list(
+            StudentAcademicPlacement.objects.filter(
+                program__institute_id=institute_id,
+                status=PlacementStatus.ACTIVE,
+                student__status=MembershipStatus.ACTIVE,
+                student__role=RoleChoices.STUDENT,
+            )
+            .values('program__department__name')
+            .annotate(total=Count('student_id', distinct=True))
+            .order_by('program__department__name')
+        )
+
+        return Response({
+            'institute': {
+                'id': str(institute.id),
+                'name': institute.name,
+                'code': institute.code,
+                'status': institute.status,
+            },
+            'metrics': {
+                'departments': Department.objects.filter(institute_id=institute_id).count(),
+                'batches': Batch.objects.filter(institute_id=institute_id).count(),
+                'teachers': memberships.filter(role=RoleChoices.TEACHER).count(),
+                'students': memberships.filter(role=RoleChoices.STUDENT).count(),
+                'subjects': Subject.objects.filter(institute_id=institute_id).count(),
+                'scheduled_exams': exam_schedules.filter(
+                    status=ExamScheduleStatus.SCHEDULED,
+                    starts_at__gte=timezone.now(),
+                ).count(),
+            },
+            'exam_statuses': list(
+                exam_schedules.values('status').annotate(total=Count('id')).order_by('status')
+            ),
+            'students_by_department': [
+                {'department': row['program__department__name'] or 'Unassigned', 'students': row['total']}
+                for row in student_distribution
+            ],
+            'upcoming_exams': [
+                {
+                    'id': str(exam.id),
+                    'paper_title': exam.paper.title,
+                    'batch_name': exam.batch.name,
+                    'starts_at': exam.starts_at,
+                    'ends_at': exam.ends_at,
+                    'published': exam.published,
+                }
+                for exam in upcoming
+            ],
+            'recent_teachers': recent_teachers,
+            'recent_students': recent_students,
+            'recent_activity': activity,
+        })
 
 
 class BaseAcademicViewSet(viewsets.ModelViewSet):
@@ -98,7 +229,7 @@ class DepartmentViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return Department.objects.all().select_related('institute')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return Department.objects.filter(institute_id__in=user_institutes).select_related('institute')
 
 
@@ -112,7 +243,7 @@ class ProgramViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return Program.objects.all().select_related('institute', 'department')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return Program.objects.filter(institute_id__in=user_institutes).select_related('institute', 'department')
 
 
@@ -126,7 +257,7 @@ class AcademicYearViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return AcademicYear.objects.all().select_related('institute')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return AcademicYear.objects.filter(institute_id__in=user_institutes).select_related('institute')
 
 
@@ -140,7 +271,7 @@ class SemesterViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return Semester.objects.all().select_related('program')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return Semester.objects.filter(program__institute_id__in=user_institutes).select_related('program')
 
 
@@ -154,7 +285,7 @@ class BatchViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return Batch.objects.all().select_related('institute', 'program')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return Batch.objects.filter(institute_id__in=user_institutes).select_related('institute', 'program')
 
 
@@ -168,7 +299,7 @@ class SectionViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return Section.objects.all().select_related('batch')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return Section.objects.filter(batch__institute_id__in=user_institutes).select_related('batch')
 
 
@@ -182,7 +313,7 @@ class SubjectViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return Subject.objects.all().select_related('institute', 'department')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return Subject.objects.filter(institute_id__in=user_institutes).select_related('institute', 'department')
 
 
@@ -195,7 +326,7 @@ class ProgramSemesterSubjectViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return ProgramSemesterSubject.objects.all().select_related('program', 'semester', 'subject')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return ProgramSemesterSubject.objects.filter(program__institute_id__in=user_institutes).select_related('program', 'semester', 'subject')
 
 
@@ -209,7 +340,7 @@ class UnitViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return Unit.objects.all().select_related('subject')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return Unit.objects.filter(subject__institute_id__in=user_institutes).select_related('subject')
 
 
@@ -223,7 +354,7 @@ class TopicViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return Topic.objects.all().select_related('unit__subject')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return Topic.objects.filter(unit__subject__institute_id__in=user_institutes).select_related('unit__subject')
 
 
@@ -237,7 +368,7 @@ class LearningOutcomeViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return LearningOutcome.objects.all().select_related('subject')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return LearningOutcome.objects.filter(subject__institute_id__in=user_institutes).select_related('subject')
 
 
@@ -300,7 +431,7 @@ class SyllabusMappingViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return SyllabusMapping.objects.all().select_related('subject', 'academic_year')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+        user_institutes = active_institute_ids(user)
         return SyllabusMapping.objects.filter(subject__institute_id__in=user_institutes).select_related('subject', 'academic_year')
 
 
@@ -311,11 +442,20 @@ class TeacherAssignmentViewSet(BaseAcademicViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_platform_admin:
-            return TeacherAssignment.objects.all().select_related('teacher__user', 'subject', 'academic_year')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
+            return TeacherAssignment.objects.all().select_related(
+                'teacher__user', 'subject', 'academic_year', 'batch', 'section'
+            )
+        user_institutes = user.memberships.filter(
+            status=MembershipStatus.ACTIVE
+        ).values_list('institute_id', flat=True)
         # Teachers can view their own assignments; Admins see all for their institute
-        is_admin = user.memberships.filter(role='institute_admin').exists()
-        qs = TeacherAssignment.objects.filter(subject__institute_id__in=user_institutes).select_related('teacher__user', 'subject', 'academic_year')
+        is_admin = user.memberships.filter(
+            role=RoleChoices.INSTITUTE_ADMIN,
+            status=MembershipStatus.ACTIVE,
+        ).exists()
+        qs = TeacherAssignment.objects.filter(subject__institute_id__in=user_institutes).select_related(
+            'teacher__user', 'subject', 'academic_year', 'batch', 'section'
+        )
         if not is_admin:
             qs = qs.filter(teacher__user=user)
         return qs
@@ -329,8 +469,13 @@ class StudentAcademicPlacementViewSet(BaseAcademicViewSet):
         user = self.request.user
         if user.is_platform_admin:
             return StudentAcademicPlacement.objects.all().select_related('student__user', 'program', 'batch', 'semester', 'section')
-        user_institutes = user.memberships.values_list('institute_id', flat=True)
-        is_admin = user.memberships.filter(role='institute_admin').exists()
+        user_institutes = user.memberships.filter(
+            status=MembershipStatus.ACTIVE
+        ).values_list('institute_id', flat=True)
+        is_admin = user.memberships.filter(
+            role=RoleChoices.INSTITUTE_ADMIN,
+            status=MembershipStatus.ACTIVE,
+        ).exists()
         qs = StudentAcademicPlacement.objects.filter(program__institute_id__in=user_institutes).select_related('student__user', 'program', 'batch', 'semester', 'section')
         if not is_admin:
             qs = qs.filter(student__user=user)
@@ -356,7 +501,8 @@ class StudentProgressionView(APIView):
         if not request.user.is_platform_admin:
             has_perm = request.user.memberships.filter(
                 institute_id=placement.program.institute_id,
-                role='institute_admin'
+                role=RoleChoices.INSTITUTE_ADMIN,
+                status=MembershipStatus.ACTIVE,
             ).exists()
             if not has_perm:
                 return Response(

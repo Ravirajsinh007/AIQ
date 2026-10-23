@@ -1,6 +1,8 @@
 from datetime import date
+from types import SimpleNamespace
 from django.urls import reverse
 from django.core.exceptions import ValidationError
+from django.test import override_settings
 from rest_framework import status
 from rest_framework.test import APITestCase
 from apps.accounts.models import (
@@ -11,6 +13,7 @@ from apps.accounts.models import (
     MembershipStatus,
 )
 from apps.academics.models import (
+    AcademicStatus,
     Department,
     Program,
     AcademicYear,
@@ -25,10 +28,17 @@ from apps.academics.models import (
     SyllabusMapping,
     TeacherAssignment,
     StudentAcademicPlacement,
+    StudentSubjectEnrollment,
     PlacementStatus,
 )
+from apps.exams.services import eligible_placements
 
 
+@override_settings(
+    EMAIL_BACKEND='django.core.mail.backends.locmem.EmailBackend',
+    EMAIL_HOST='smtp.example.test',
+    DEFAULT_FROM_EMAIL='noreply@example.test',
+)
 class M2AcademicStructureTests(APITestCase):
 
     def setUp(self):
@@ -302,6 +312,403 @@ class M2AcademicStructureTests(APITestCase):
         })
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
+    def test_alpha_admin_cannot_create_section_using_beta_batch(self):
+        department = Department.objects.create(
+            institute=self.institute_beta,
+            code='BIO',
+            name='Biology',
+        )
+        program = Program.objects.create(
+            institute=self.institute_beta,
+            department=department,
+            code='BSC-BIO',
+            name='Biology',
+            duration_years=3,
+            total_semesters=6,
+        )
+        batch = Batch.objects.create(
+            institute=self.institute_beta,
+            program=program,
+            name='Beta 2025',
+            admission_year=2025,
+        )
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(reverse('section-list'), {
+            'batch': str(batch.id),
+            'name': 'Cross-tenant section',
+        })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(Section.objects.filter(name='Cross-tenant section').exists())
+
+    def test_department_list_is_scoped_to_active_admin_memberships(self):
+        Department.objects.create(
+            institute=self.institute_beta,
+            code='BIO',
+            name='Biology',
+        )
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.get(reverse('department-list'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {row['code'] for row in response.data['results']},
+            {'CSE'},
+        )
+
+    def test_institute_admin_dashboard_returns_only_authorized_institute(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.get(
+            reverse('institute-admin-dashboard'),
+            {'institute': str(self.institute_alpha.id)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['institute']['id'], str(self.institute_alpha.id))
+        self.assertEqual(response.data['metrics']['departments'], 1)
+        self.assertEqual(response.data['metrics']['students'], 1)
+        self.assertEqual(response.data['metrics']['teachers'], 1)
+        self.assertEqual(
+            response.data['metrics']['batches'],
+            Batch.objects.filter(institute=self.institute_alpha).count(),
+        )
+
+    def test_batch_can_be_created_from_department_without_exposing_program_setup(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(reverse('batch-list'), {
+            'institute': str(self.institute_alpha.id),
+            'department': str(self.dept_cs.id),
+            'name': 'CSE 2026',
+            'admission_year': 2026,
+            'status': 'active',
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        batch = Batch.objects.get(id=response.data['id'])
+        self.assertEqual(batch.program.department_id, self.dept_cs.id)
+        self.assertTrue(batch.program.is_department_mapping)
+        self.assertEqual(batch.program.qualification_type, '')
+        self.assertIsNone(batch.program.duration_years)
+        self.assertIsNone(batch.program.total_semesters)
+        self.assertEqual(str(response.data['department']), str(self.dept_cs.id))
+        self.assertEqual(response.data['department_name'], self.dept_cs.name)
+
+    def test_batch_create_rejects_department_from_another_institute(self):
+        beta_department = Department.objects.create(
+            institute=self.institute_beta,
+            code='BIO',
+            name='Biology',
+        )
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(reverse('batch-list'), {
+            'institute': str(self.institute_alpha.id),
+            'department': str(beta_department.id),
+            'name': 'Invalid batch',
+            'admission_year': 2026,
+        })
+        self.assertNotEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertFalse(Batch.objects.filter(name='Invalid batch').exists())
+
+    def test_student_creation_assigns_department_batch_and_subjects(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(
+            reverse('institute-members-list-create', kwargs={'institute_id': self.institute_alpha.id}),
+            {
+                'email': 'newstudent@alpha.edu',
+                'first_name': 'New',
+                'last_name': 'Student',
+                'role': RoleChoices.STUDENT,
+                'identifier': 'roll-2026-01',
+                'department': str(self.dept_cs.id),
+                'batch': str(self.batch_2025.id),
+                'subject_ids': [str(self.subj_dsa.id)],
+                'initial_password': 'StudentCreation!42',
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        membership = UserInstituteMembership.objects.get(user__email='newstudent@alpha.edu')
+        placement = StudentAcademicPlacement.objects.get(student=membership, status=PlacementStatus.ACTIVE)
+        enrollment = StudentSubjectEnrollment.objects.get(
+            student=membership,
+            batch=self.batch_2025,
+            subject=self.subj_dsa,
+            status=AcademicStatus.ACTIVE,
+        )
+        self.assertEqual(membership.identifier, 'ROLL-2026-01')
+        self.assertEqual(placement.program_id, self.batch_2025.program_id)
+        self.assertIsNone(placement.semester_id)
+        self.assertEqual(enrollment.subject_id, self.subj_dsa.id)
+        self.assertEqual(response.data['department_name'], self.dept_cs.name)
+        self.assertEqual(response.data['batch_name'], self.batch_2025.name)
+        self.assertEqual(response.data['enrolled_subject_codes'], [self.subj_dsa.code])
+        self.assertFalse(ProgramSemesterSubject.objects.filter(
+            program=self.batch_2025.program,
+            subject=self.subj_dsa,
+        ).exists())
+
+    def test_student_creation_rejects_cross_institute_subjects(self):
+        beta_department = Department.objects.create(
+            institute=self.institute_beta,
+            code='BIO',
+            name='Biology',
+        )
+        beta_subject = Subject.objects.create(
+            institute=self.institute_beta,
+            department=beta_department,
+            code='BIO101',
+            name='Biology',
+        )
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(
+            reverse('institute-members-list-create', kwargs={'institute_id': self.institute_alpha.id}),
+            {
+                'email': 'crossinstitute@alpha.edu',
+                'first_name': 'Cross',
+                'last_name': 'Institute',
+                'role': RoleChoices.STUDENT,
+                'identifier': 'ROLL-CROSS',
+                'department': str(self.dept_cs.id),
+                'batch': str(self.batch_2025.id),
+                'subject_ids': [str(beta_subject.id)],
+                'initial_password': 'CrossInstitute!42',
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertFalse(UserInstituteMembership.objects.filter(user__email='crossinstitute@alpha.edu').exists())
+
+    def test_student_membership_update_changes_subject_enrollment(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        create_response = self.client.post(
+            reverse('institute-members-list-create', kwargs={'institute_id': self.institute_alpha.id}),
+            {
+                'email': 'editable@alpha.edu',
+                'first_name': 'Editable',
+                'last_name': 'Student',
+                'role': RoleChoices.STUDENT,
+                'identifier': 'ROLL-EDIT',
+                'department': str(self.dept_cs.id),
+                'batch': str(self.batch_2025.id),
+                'subject_ids': [str(self.subj_dsa.id)],
+                'initial_password': 'EditableStudent!42',
+            },
+        )
+        self.assertEqual(create_response.status_code, status.HTTP_201_CREATED, create_response.data)
+        membership = UserInstituteMembership.objects.get(user__email='editable@alpha.edu')
+        second_subject = Subject.objects.create(
+            institute=self.institute_alpha,
+            department=self.dept_cs,
+            code='CS102',
+            name='Algorithms',
+        )
+        update_response = self.client.patch(
+            reverse('institute-member-detail', kwargs={
+                'institute_id': self.institute_alpha.id,
+                'membership_id': membership.id,
+            }),
+            {
+                'identifier': 'ROLL-EDIT-2',
+                'department': str(self.dept_cs.id),
+                'batch': str(self.batch_2025.id),
+                'subject_ids': [str(second_subject.id)],
+            },
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK, update_response.data)
+        self.assertEqual(update_response.data['enrolled_subject_codes'], [second_subject.code])
+        self.assertTrue(StudentSubjectEnrollment.objects.filter(
+            student=membership,
+            subject=self.subj_dsa,
+            status=AcademicStatus.INACTIVE,
+        ).exists())
+        self.assertTrue(StudentSubjectEnrollment.objects.filter(
+            student=membership,
+            subject=second_subject,
+            status=AcademicStatus.ACTIVE,
+        ).exists())
+
+    def test_exam_eligibility_uses_explicit_enrollment_and_legacy_fallback(self):
+        placement = StudentAcademicPlacement.objects.create(
+            student=self.student_alpha_membership,
+            program=self.prog_btech,
+            batch=self.batch_2025,
+            semester=self.sem1,
+            section=self.sec_a,
+        )
+        ProgramSemesterSubject.objects.create(
+            program=self.prog_btech,
+            semester=self.sem1,
+            subject=self.subj_dsa,
+        )
+        exam = SimpleNamespace(
+            institute_id=self.institute_alpha.id,
+            batch_id=self.batch_2025.id,
+            section_id=self.sec_a.id,
+            paper=SimpleNamespace(
+                subject_id=self.subj_dsa.id,
+                blueprint=SimpleNamespace(
+                    program_id=self.prog_btech.id,
+                    semester_id=self.sem1.id,
+                ),
+            ),
+        )
+        self.assertTrue(eligible_placements(exam, self.student_alpha).filter(pk=placement.pk).exists())
+        enrollment = StudentSubjectEnrollment.objects.create(
+            student=self.student_alpha_membership,
+            batch=self.batch_2025,
+            subject=self.subj_dsa,
+            status=AcademicStatus.INACTIVE,
+        )
+        self.assertFalse(eligible_placements(exam, self.student_alpha).filter(pk=placement.pk).exists())
+        enrollment.status = AcademicStatus.ACTIVE
+        enrollment.save(update_fields=['status'])
+        self.assertTrue(eligible_placements(exam, self.student_alpha).filter(pk=placement.pk).exists())
+
+        other_program = Program.objects.create(
+            institute=self.institute_alpha,
+            department=self.dept_cs,
+            code='MISMATCH',
+            name='Unrelated Program',
+            duration_years=3,
+            total_semesters=6,
+        )
+        other_semester = Semester.objects.create(
+            program=other_program,
+            semester_number=2,
+            label='Unrelated Semester',
+        )
+        exam.paper.blueprint = SimpleNamespace(
+            program_id=other_program.id,
+            semester_id=other_semester.id,
+        )
+        self.assertTrue(
+            eligible_placements(exam, self.student_alpha).filter(pk=placement.pk).exists(),
+            'An explicit subject enrollment must not be blocked by legacy program/semester filters.',
+        )
+
+        enrollment.delete()
+        self.assertFalse(
+            eligible_placements(exam, self.student_alpha).filter(pk=placement.pk).exists(),
+            'Legacy curriculum access must still match the blueprint program and semester.',
+        )
+
+    def test_student_course_list_returns_active_subject_enrollments(self):
+        placement = StudentAcademicPlacement.objects.create(
+            student=self.student_alpha_membership,
+            program=self.prog_btech,
+            batch=self.batch_2025,
+            semester=None,
+        )
+        other_subject = Subject.objects.create(
+            institute=self.institute_alpha,
+            department=self.dept_cs,
+            code='CS102',
+            name='Algorithms',
+        )
+        StudentSubjectEnrollment.objects.create(
+            student=self.student_alpha_membership,
+            batch=self.batch_2025,
+            subject=self.subj_dsa,
+            status=AcademicStatus.ACTIVE,
+        )
+        StudentSubjectEnrollment.objects.create(
+            student=self.student_alpha_membership,
+            batch=self.batch_2025,
+            subject=other_subject,
+            status=AcademicStatus.INACTIVE,
+        )
+        self.client.force_authenticate(user=self.student_alpha)
+
+        response = self.client.get(reverse('student-placement-list'), {'status': 'active'})
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['results'][0]['id'], str(placement.id))
+        self.assertEqual(response.data['results'][0]['department_name'], self.dept_cs.name)
+        self.assertEqual(response.data['results'][0]['enrolled_subject_codes'], [self.subj_dsa.code])
+        self.assertIsNone(response.data['results'][0]['semester_label'])
+
+    def test_subject_creation_assigns_teacher_without_academic_year_input(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(reverse('subject-list'), {
+            'institute': str(self.institute_alpha.id),
+            'department': str(self.dept_cs.id),
+            'code': 'CS205',
+            'name': 'Algorithms',
+            'credit_hours': '3.0',
+            'teacher_ids': [str(self.teacher_alpha_membership.id)],
+        })
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        subject = Subject.objects.get(id=response.data['id'])
+        assignment = TeacherAssignment.objects.get(
+            teacher=self.teacher_alpha_membership,
+            subject=subject,
+            status='active',
+        )
+        self.assertIsNone(assignment.academic_year_id)
+        self.assertEqual(
+            [str(value) for value in response.data['assigned_teacher_ids']],
+            [str(self.teacher_alpha_membership.id)],
+        )
+
+    def test_subject_assignment_rejects_teacher_from_another_institute(self):
+        beta_teacher = User.objects.create_user(
+            email='teacher@beta.edu',
+            password='Password123!',
+            first_name='Beta',
+            last_name='Teacher',
+        )
+        beta_membership = UserInstituteMembership.objects.create(
+            user=beta_teacher,
+            institute=self.institute_beta,
+            role=RoleChoices.TEACHER,
+            status=MembershipStatus.ACTIVE,
+        )
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.post(reverse('subject-list'), {
+            'institute': str(self.institute_alpha.id),
+            'department': str(self.dept_cs.id),
+            'code': 'CS206',
+            'name': 'Data Science',
+            'credit_hours': '3.0',
+            'teacher_ids': [str(beta_membership.id)],
+        })
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.data)
+        self.assertFalse(Subject.objects.filter(code='CS206').exists())
+
+    def test_institute_admin_dashboard_rejects_another_institute(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.get(
+            reverse('institute-admin-dashboard'),
+            {'institute': str(self.institute_beta.id)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_institute_admin_dashboard_returns_real_zero_counts_for_empty_institute(self):
+        self.client.force_authenticate(user=self.beta_admin)
+        response = self.client.get(
+            reverse('institute-admin-dashboard'),
+            {'institute': str(self.institute_beta.id)},
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.assertEqual(response.data['metrics']['departments'], 0)
+        self.assertEqual(response.data['metrics']['students'], 0)
+        self.assertEqual(response.data['upcoming_exams'], [])
+        self.assertEqual(response.data['recent_activity'], [])
+
+    def test_institute_admin_can_update_only_institute_contact_fields(self):
+        self.client.force_authenticate(user=self.alpha_admin)
+        response = self.client.patch(
+            reverse('institute-detail', kwargs={'institute_id': self.institute_alpha.id}),
+            {
+                'contact_email': 'office@alpha.edu',
+                'contact_phone': '+1 555 0100',
+                'address': 'Updated campus address',
+                'name': 'Unauthorized rename',
+                'status': 'suspended',
+            },
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        self.institute_alpha.refresh_from_db()
+        self.assertEqual(self.institute_alpha.contact_email, 'office@alpha.edu')
+        self.assertEqual(self.institute_alpha.contact_phone, '+1 555 0100')
+        self.assertEqual(self.institute_alpha.address, 'Updated campus address')
+        self.assertEqual(self.institute_alpha.name, 'Alpha Engineering Institute')
+        self.assertEqual(self.institute_alpha.status, 'active')
+
     def test_teacher_cannot_create_subjects(self):
         self.client.force_authenticate(user=self.teacher_alpha)
         url = reverse('subject-list')
@@ -324,6 +731,12 @@ class M2AcademicStructureTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data['results']), 1)
         self.assertEqual(response.data['results'][0]['subject_code'], 'CS101')
+
+    def test_teacher_can_read_academic_structure_in_an_active_member_institute(self):
+        self.client.force_authenticate(user=self.teacher_alpha)
+        response = self.client.get(reverse('department-list'))
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([row['code'] for row in response.data['results']], ['CSE'])
 
     # --------------------------------------------------------------------------
     # Student Academic Placement & Historical Progression Tests

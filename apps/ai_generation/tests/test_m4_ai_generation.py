@@ -13,7 +13,15 @@ from apps.accounts.models import (
     RoleChoices,
     MembershipStatus,
 )
-from apps.academics.models import Department, Subject, Unit, Topic, LearningOutcome
+from apps.academics.models import (
+    AcademicYear,
+    Department,
+    Subject,
+    TeacherAssignment,
+    Unit,
+    Topic,
+    LearningOutcome,
+)
 from apps.questions.models import (
     Question,
     QuestionOrigin,
@@ -88,6 +96,12 @@ class M4AIGenerationEngineTests(APITestCase):
         # 2. Institutes: Alpha & Beta
         self.institute_alpha = Institute.objects.create(code='ALPHA', name='Alpha University')
         self.institute_beta = Institute.objects.create(code='BETA', name='Beta University')
+        self.academic_year_alpha = AcademicYear.objects.create(
+            institute=self.institute_alpha,
+            label='2026-2027',
+            start_date='2026-07-01',
+            end_date='2027-06-30',
+        )
 
         # 3. Alpha Teacher
         self.teacher_alpha = User.objects.create_user(
@@ -128,6 +142,15 @@ class M4AIGenerationEngineTests(APITestCase):
             subject=self.subj_dsa,
             code='CO1',
             description='Analyze time complexity of self-balancing search trees.'
+        )
+        self.teacher_alpha_membership = self.teacher_alpha.memberships.get(
+            institute=self.institute_alpha,
+            role=RoleChoices.TEACHER,
+        )
+        TeacherAssignment.objects.create(
+            teacher=self.teacher_alpha_membership,
+            subject=self.subj_dsa,
+            academic_year=self.academic_year_alpha,
         )
 
         # 6. Academic Hierarchy for Beta
@@ -494,7 +517,7 @@ class M4AIGenerationEngineTests(APITestCase):
         mock_instance = MockProvider.return_value
         mock_instance.generate_questions.return_value = (
             mocked_candidates,
-            {'provider': 'mock_gemini', 'model': 'gemini-2.5-flash', 'candidates_returned': 5}
+            {'provider': 'mock_gemini', 'model': 'gemini-3.8-flash', 'candidates_returned': 5}
         )
 
         self.client.force_authenticate(user=self.teacher_alpha)

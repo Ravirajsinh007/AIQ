@@ -1,4 +1,5 @@
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
@@ -45,18 +46,29 @@ class QuestionReviewWorkflowViewSet(viewsets.GenericViewSet):
 
         memberships = user.memberships.filter(
             status=MembershipStatus.ACTIVE,
-            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF, RoleChoices.TEACHER],
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
         )
         institute_ids = memberships.values_list('institute_id', flat=True)
-        return Question.objects.filter(institute_id__in=institute_ids).select_related(
+        teacher_subjects = user.memberships.filter(
+            status=MembershipStatus.ACTIVE,
+            role=RoleChoices.TEACHER,
+            teaching_assignments__status='active',
+        ).values_list('teaching_assignments__subject_id', flat=True)
+        return Question.objects.filter(
+            Q(institute_id__in=institute_ids) | Q(subject_id__in=teacher_subjects)
+        ).select_related(
             'institute', 'subject', 'unit', 'topic', 'learning_outcome', 'created_by'
         ).prefetch_related('options', 'rubrics', 'source_references', 'tags', 'verification_reviews')
 
     def _get_active_membership(self, institute):
-        return self.request.user.memberships.filter(
+        memberships = self.request.user.memberships.filter(
             institute=institute,
-            status=MembershipStatus.ACTIVE
-        ).first()
+            status=MembershipStatus.ACTIVE,
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF, RoleChoices.TEACHER],
+        )
+        return memberships.filter(
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF]
+        ).first() or memberships.filter(role=RoleChoices.TEACHER).first()
 
     @extend_schema(
         summary="List Questions Pending Review",

@@ -47,13 +47,29 @@ class CanReviewQuestions(permissions.BasePermission):
         if not institute_id and hasattr(obj, 'question'):
             institute_id = obj.question.institute_id
 
-        user_membership = request.user.memberships.filter(
+        manager_membership = request.user.memberships.filter(
             institute_id=institute_id,
-            role__in=[RoleChoices.TEACHER, RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
+            role__in=[RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF],
             status=MembershipStatus.ACTIVE
         ).first()
 
-        if not user_membership:
+        if manager_membership:
+            return True
+
+        teacher_membership = request.user.memberships.filter(
+            institute_id=institute_id,
+            role=RoleChoices.TEACHER,
+            status=MembershipStatus.ACTIVE,
+        ).first()
+        if teacher_membership is None:
+            return False
+        subject_id = getattr(obj, 'subject_id', None)
+        if subject_id is None and hasattr(obj, 'question'):
+            subject_id = obj.question.subject_id
+        if not teacher_membership.teaching_assignments.filter(
+            subject_id=subject_id,
+            status='active',
+        ).exists():
             return False
 
         # Read-only safe methods
@@ -61,10 +77,4 @@ class CanReviewQuestions(permissions.BasePermission):
             return True
 
         # Write/review actions
-        if user_membership.role in [RoleChoices.INSTITUTE_ADMIN, RoleChoices.EXAM_STAFF]:
-            return True
-
-        if user_membership.role == RoleChoices.TEACHER:
-            return True
-
-        return False
+        return True

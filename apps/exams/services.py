@@ -6,7 +6,13 @@ from django.utils import timezone
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError as APIValidationError
 
 from apps.accounts.models import MembershipStatus, RoleChoices
-from apps.academics.models import PlacementStatus, ProgramSemesterSubject, StudentAcademicPlacement
+from apps.academics.models import (
+    AcademicStatus,
+    PlacementStatus,
+    ProgramSemesterSubject,
+    StudentAcademicPlacement,
+    StudentSubjectEnrollment,
+)
 from apps.blueprints.models import GeneratedPaperQuestion
 
 from .models import (
@@ -55,18 +61,39 @@ def eligible_placements(exam, user, at=None):
         placements = placements.filter(section_id=exam.section_id)
 
     blueprint = exam.paper.blueprint
-    if blueprint.program_id:
-        placements = placements.filter(program_id=blueprint.program_id)
-    if blueprint.semester_id:
-        placements = placements.filter(semester_id=blueprint.semester_id)
-
-    # A placement in a program/semester is the enrollment record for that subject.
-    enrollment = ProgramSemesterSubject.objects.filter(
+    # New records use explicit student enrollments; legacy placements retain curriculum-based access.
+    has_explicit_enrollments = StudentSubjectEnrollment.objects.filter(
+        student_id=OuterRef('student_id'),
+        batch_id=OuterRef('batch_id'),
+    )
+    explicit_subject_enrollment = StudentSubjectEnrollment.objects.filter(
+        student_id=OuterRef('student_id'),
+        batch_id=OuterRef('batch_id'),
+        subject_id=exam.paper.subject_id,
+        status=AcademicStatus.ACTIVE,
+    )
+    curriculum_enrollment = ProgramSemesterSubject.objects.filter(
         program_id=OuterRef('program_id'),
         semester_id=OuterRef('semester_id'),
         subject_id=exam.paper.subject_id,
     )
-    return placements.annotate(_is_enrolled=Exists(enrollment)).filter(_is_enrolled=True)
+    placements = placements.annotate(
+        _has_explicit_enrollments=Exists(has_explicit_enrollments),
+        _has_explicit_subject=Exists(explicit_subject_enrollment),
+        _has_legacy_curriculum=Exists(curriculum_enrollment),
+    )
+    legacy_curriculum_access = Q(
+        _has_explicit_enrollments=False,
+        _has_legacy_curriculum=True,
+    )
+    if blueprint.program_id:
+        legacy_curriculum_access &= Q(program_id=blueprint.program_id)
+    if blueprint.semester_id:
+        legacy_curriculum_access &= Q(semester_id=blueprint.semester_id)
+    return placements.filter(
+        Q(_has_explicit_enrollments=True, _has_explicit_subject=True)
+        | legacy_curriculum_access
+    )
 
 
 def find_eligible_placement(exam, user, at=None):

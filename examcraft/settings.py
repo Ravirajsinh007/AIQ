@@ -162,6 +162,15 @@ else:
             }
         }
 
+if not IS_TESTING and not DATABASES['default']['ENGINE'].startswith(
+    'django.db.backends.postgresql'
+):
+    from django.core.exceptions import ImproperlyConfigured
+
+    raise ImproperlyConfigured(
+        'ExamCraft requires PostgreSQL for application runs. SQLite is reserved for isolated tests.'
+    )
+
 # ==============================================================================
 # Custom User Model (M1 User & Access Management)
 # ==============================================================================
@@ -289,7 +298,7 @@ CORS_ALLOW_CREDENTIALS = True
 # Google Gemini API Settings (M4 Backend Integration)
 # ==============================================================================
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash')
 
 # M18 SMTP delivery configuration. The application records notifications in-app
 # even when email delivery has not been configured.
@@ -301,6 +310,7 @@ EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True').lower() in ('true', '1', 'yes
 EMAIL_USE_SSL = os.getenv('EMAIL_USE_SSL', 'False').lower() in ('true', '1', 'yes')
 DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', '')
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', 'http://localhost:4200').rstrip('/')
 
 # M11 isolated execution-provider integration (submitted code never runs in Django).
 CODE_EXECUTION_PROVIDER_URL = os.getenv('CODE_EXECUTION_PROVIDER_URL', '')

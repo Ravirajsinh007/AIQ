@@ -194,6 +194,37 @@ class OnlineExamDeliveryTests(APITestCase):
             status.HTTP_400_BAD_REQUEST,
         )
 
+    def test_department_mapping_batch_can_schedule_subject_paper_without_term_data(self):
+        self.program.is_department_mapping = True
+        self.program.qualification_type = ''
+        self.program.duration_years = None
+        self.program.total_semesters = None
+        self.program.save(update_fields=[
+            'is_department_mapping',
+            'qualification_type',
+            'duration_years',
+            'total_semesters',
+            'updated_at',
+        ])
+        other_program = Program.objects.create(
+            institute=self.institute,
+            department=self.department,
+            code='OTHER',
+            name='Other Program',
+            duration_years=3,
+            total_semesters=6,
+        )
+        other_semester = Semester.objects.create(
+            program=other_program,
+            semester_number=2,
+            label='Semester 2',
+        )
+        self.blueprint.program = other_program
+        self.blueprint.semester = other_semester
+        self.blueprint.save()
+
+        self.exam.full_clean()
+
     def test_another_student_cannot_read_or_change_attempt(self):
         attempt_response = self.client.post(
             reverse('exam-start', kwargs={'pk': self.exam.id}), {}, format='json'

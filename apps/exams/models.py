@@ -149,18 +149,22 @@ class ExamSchedule(models.Model):
             errors['section'] = 'Section must belong to the selected batch.'
         if self.paper_id and self.batch_id:
             blueprint = self.paper.blueprint
-            if blueprint.program_id and blueprint.program_id != self.batch.program_id:
-                errors['batch'] = 'Batch program must match the paper blueprint program.'
-            if blueprint.semester_id and blueprint.semester.program_id != self.batch.program_id:
-                errors['batch'] = 'Batch program must match the paper blueprint semester.'
-            if blueprint.semester_id and not ProgramSemesterSubject.objects.filter(
-                program_id=self.batch.program_id,
-                semester_id=blueprint.semester_id,
-                subject_id=self.paper.subject_id,
-            ).exists():
-                errors['batch'] = (
-                    'The paper subject must be included in the selected batch program semester.'
-                )
+            if self.batch.program.is_department_mapping:
+                if self.paper.subject.department_id != self.batch.program.department_id:
+                    errors['batch'] = 'Paper subject must belong to the selected batch department.'
+            else:
+                if blueprint.program_id and blueprint.program_id != self.batch.program_id:
+                    errors['batch'] = 'Batch program must match the paper blueprint program.'
+                if blueprint.semester_id and blueprint.semester.program_id != self.batch.program_id:
+                    errors['batch'] = 'Batch program must match the paper blueprint semester.'
+                if blueprint.semester_id and not ProgramSemesterSubject.objects.filter(
+                    program_id=self.batch.program_id,
+                    semester_id=blueprint.semester_id,
+                    subject_id=self.paper.subject_id,
+                ).exists():
+                    errors['batch'] = (
+                        'The paper subject must be included in the selected batch program semester.'
+                    )
         if errors:
             raise ValidationError(errors)
 
